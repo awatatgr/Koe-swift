@@ -104,6 +104,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
+        trackEvent("app_launch")
         setupMenu()
         reregisterHotkey()
         recorder.prepare()
@@ -379,6 +380,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 WhisperServer.shared.start()
             }
         }
+    }
+
+
+    private func trackEvent(_ event: String) {
+        guard let url = URL(string: "https://atsm-pulse.fly.dev/e") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["project": "koe", "event": event])
+        req.timeoutInterval = 3
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
