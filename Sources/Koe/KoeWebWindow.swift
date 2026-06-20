@@ -10,7 +10,8 @@ final class KoeWebWindow: NSObject, NSWindowDelegate, WKUIDelegate {
 
     private var window: NSWindow?
     private var webView: WKWebView?
-    private static let appURL = URL(string: "https://koe.live/app")!
+    // [KOE] フロー（ラフ入力→[KOE]→言葉→意味＋本人声読み上げ）入りの個人ページを開く。
+    private static let appURL = URL(string: "https://voice.koe.live/me")!
 
     func show() {
         if window == nil { build() }
