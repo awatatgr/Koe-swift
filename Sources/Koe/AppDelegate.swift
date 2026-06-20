@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Carbon.HIToolbox
 import Speech
 import UniformTypeIdentifiers
@@ -12,6 +13,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// rebuildMenu() で組んだメニューの保持先。左クリック=読み上げにするため
     /// statusItem.menu には常設せず、右クリック時だけ手動でポップアップする。
     private var statusMenu: NSMenu?
+    /// 本人声(ネット/鍵)が使えない時のオフライン保険。これがあるので「誰でも」必ず声が出る。
+    private let systemSpeech = AVSpeechSynthesizer()
     private var overlay: OverlayWindow?
     private var settingsWC: SettingsWindowController?
     private var setupWindow: SetupWindow?
@@ -2494,9 +2497,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         MyVoiceTTS.shared.speak(target) { [weak self] ok, message in
             self?.overlay?.hide()
             if !ok {
-                self?.sendNotification(text: message)
+                // 本人声が使えない(オフライン/未疎通/鍵なし)時も、必ず声は出す。
+                // macOS 内蔵音声へフォールバック＝設定ゼロで誰でも使える。
+                self?.speakWithSystemVoice(target)
+                self?.sendNotification(text: "オフライン音声で読み上げました（本人声: \(message)）")
             }
         }
+    }
+
+    /// macOS 内蔵の音声合成で読み上げる（オフライン・鍵不要のフォールバック）。
+    /// 日本語が含まれれば ja-JP、なければ端末既定/英語を選ぶ。
+    private func speakWithSystemVoice(_ text: String) {
+        systemSpeech.stopSpeaking(at: .immediate)
+        let u = AVSpeechUtterance(string: text)
+        let hasJa = text.unicodeScalars.contains { $0.value >= 0x3040 && $0.value <= 0x30FF
+            || ($0.value >= 0x4E00 && $0.value <= 0x9FFF) }
+        let lang = hasJa ? "ja-JP" : "en-US"
+        u.voice = AVSpeechSynthesisVoice(language: lang)
+        u.rate = AVSpeechUtteranceDefaultSpeechRate
+        systemSpeech.speak(u)
     }
 
     @objc func toggleAlwaysOnRecording() {
