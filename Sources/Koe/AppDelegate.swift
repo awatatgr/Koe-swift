@@ -9,6 +9,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var shared: AppDelegate?
 
     private var statusItem: NSStatusItem!
+    /// rebuildMenu() で組んだメニューの保持先。左クリック=読み上げにするため
+    /// statusItem.menu には常設せず、右クリック時だけ手動でポップアップする。
+    private var statusMenu: NSMenu?
     private var overlay: OverlayWindow?
     private var settingsWC: SettingsWindowController?
     private var setupWindow: SetupWindow?
@@ -425,7 +428,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.toolTip = "Koe — 声で入力"
+        statusItem.button?.toolTip = "Koe — クリックで読み上げ / 右クリックでメニュー"
         setIcon(recording: false)
         rebuildMenu()
 
@@ -435,6 +438,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // DropDelegateをretainしておく
         objc_setAssociatedObject(statusItem.button!, "dropDelegate", dropDelegate, .OBJC_ASSOCIATION_RETAIN)
         statusItem.button?.wantsLayer = true
+
+        // クリックで即・本人声で読み上げ（選択テキスト→クリップボード→直近認識結果）。
+        // 左クリック=読み上げ / 右クリック・Control+クリック=メニュー。
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusItemClicked)
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         // 設定に応じて可視性を適用
         updateStatusItemVisibility()
@@ -559,7 +568,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: L10n.menuSettings, action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(withTitle: L10n.menuQuit, action: #selector(quit), keyEquivalent: "q")
-        statusItem?.menu = menu
+        // 左クリック=読み上げにするため menu は常設せず保持だけ（右クリックで手動表示）
+        statusMenu = menu
     }
 
     func setIcon(recording: Bool) {
@@ -2434,6 +2444,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// 🗣 自分の声で読み上げ: 選択テキスト → クリップボード → 直近の認識結果 の順で対象を決め、
     /// koe-mcp (https://mcp.koe.live/mcp) の `speak` ツールへ HTTP(JSON-RPC) で本人声クローン合成を依頼して再生する。
     /// (旧 SSH 経由 `ssh m5 → koe_say.py` は廃止済み。実装は MyVoiceTTS.shared.speak)
+    /// メニューバーアイコンのクリック処理。
+    /// 左クリック=本人声で読み上げ / 右クリック・Control+クリック=メニュー。
+    @objc private func statusItemClicked() {
+        let event = NSApp.currentEvent
+        let wantsMenu = event?.type == .rightMouseUp
+            || event?.modifierFlags.contains(.control) == true
+        if wantsMenu {
+            guard let menu = statusMenu else { return }
+            statusItem.menu = menu
+            statusItem.button?.performClick(nil)  // メニューをポップアップ
+            statusItem.menu = nil                 // 次の左クリックで action が呼ばれるよう解除
+        } else {
+            speakWithMyVoice()  // 選択テキスト→クリップボード→直近認識結果 を本人声で
+        }
+    }
+
     @objc func speakWithMyVoice() {
         var text = ""
         // 1. アクセシビリティで選択テキスト
