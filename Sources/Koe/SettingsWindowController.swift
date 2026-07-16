@@ -375,6 +375,22 @@ struct GeneralTab: View {
                     .foregroundColor(Lux.gold)
             }
 
+            // 2026-07 簡略化（本人指示）: 録音トグル以外のホットキーは任意設定・デフォルトOFF。
+            // OFFの間もメニューバーからクリックで同じ機能が使えるので、ここは上級者向け。
+            Section {
+                Text("覚えるショートカットは録音トグル（\(settings.shortcutDisplayString)）だけで十分使えます。以下は必要な人だけ ON にしてください。オフでもメニューバーから同じ操作ができます。")
+                    .font(.system(size: 10)).foregroundColor(.secondary)
+                Toggle("🌐 翻訳ホットキー（⌥⌘T）", isOn: $settings.translateHotkeyEnabled)
+                    .onChange(of: settings.translateHotkeyEnabled) { _ in AppDelegate.shared?.reregisterHotkey() }
+                Toggle("📝 議事録ホットキー（⌥⌘M）", isOn: $settings.meetingHotkeyEnabled)
+                    .onChange(of: settings.meetingHotkeyEnabled) { _ in AppDelegate.shared?.reregisterHotkey() }
+                Toggle("↺ 再認識ホットキー（⌃⌥R）", isOn: $settings.rerecognizeHotkeyEnabled)
+                    .onChange(of: settings.rerecognizeHotkeyEnabled) { _ in AppDelegate.shared?.reregisterHotkey() }
+            } header: {
+                Label("上級者向けホットキー（任意）", systemImage: "command")
+                    .foregroundColor(Lux.gold)
+            }
+
             // Overlay / 配信表示
             Section {
                 Toggle("配信モード（大文字表示）", isOn: $settings.overlayLargeTextMode)

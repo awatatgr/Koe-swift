@@ -33,7 +33,7 @@ final class KoeWebWindow: NSObject, NSWindowDelegate, WKUIDelegate {
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false
         )
-        w.title = "💬 Koe メッセージ"
+        w.title = "💬 KOE メッセージ"
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.contentView = wv

@@ -27,7 +27,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var carbonTranslateHotKeyRef: EventHotKeyRef?
     private var carbonSpaceHotKeyRef: EventHotKeyRef?
     private var carbonEscHotKeyRef: EventHotKeyRef?
-    private var carbonCmdKHotKeyRef: EventHotKeyRef?
     private var carbonMeetingHotKeyRef: EventHotKeyRef?
     private var carbonRerecognizeHotKeyRef: EventHotKeyRef?
     private var carbonEventHandlerRef: EventHandlerRef?
@@ -40,6 +39,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isRecording      = false
     private var recordingStart:  Date?
     private var activeAppBundleID = ""
+    // 🎙 ウェイクワード(「ヘイ、Koe」)検出直後〜次の録音開始までの一時フラグ(startRecordingで即消費)
+    private var wakeTriggeredThisSession = false
+    // startRecording時点で確定した「このセッションはウェイクワード起動か」。認識結果はタイプ入力/ローカルAgentModeでなく
+    // koe.live/agentと同じKoeエージェント(Claude+MCP)へ送る(2026-07-14本人指示)。中断パスをすべて追わなくて済むよう
+    // startRecordingで一度だけ確定させる設計(次のstartRecordingで上書きされるので明示的なリセットは不要)
+    private var recognitionWakeTriggered = false
 
     // Silence-based auto-stop (VAD: 直近フレームの平滑化で誤検出を低減)
     private let voiceThresholdBase: Float = 0.08  // 基本閾値（環境ノイズで動的に上昇）
@@ -332,7 +337,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        WakeWordDetector.shared.onDetected = { [weak self] in self?.startRecording() }
+        WakeWordDetector.shared.onDetected = { [weak self] in
+            self?.wakeTriggeredThisSession = true
+            self?.startRecording()
+        }
         if AppSettings.shared.wakeWordEnabled { WakeWordDetector.shared.start() }
         if AppSettings.shared.floatingButtonEnabled { FloatingButton.shared.show() }
 
@@ -475,7 +483,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(hint)
         menu.addItem(.separator())
 
-        // 言語切替 (すべてサブメニューにまとめる)
+        // かく(入力): 言語 / 入力モード / LLMモードを1グループに(v3: グルーピング再編・機能は不変)
         let langSubMenu = NSMenu()
         for lang in s.menuBarLanguages + s.otherLanguages {
             let item = NSMenuItem(title: "\(lang.flag) \(lang.name)", action: #selector(selectLanguage(_:)), keyEquivalent: "")
@@ -487,7 +495,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let langItem = NSMenuItem(title: "\(s.languageFlag) \(currentLangName)", action: nil, keyEquivalent: "")
         langItem.submenu = langSubMenu
         menu.addItem(langItem)
-        menu.addItem(.separator())
 
         // 入力モード: シームレス + ウェイクワードを 1 サブメニューに集約 (トップ階層のボタン削減)
         let inputModeMenu = NSMenu()
@@ -506,10 +513,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alwaysItem.toolTip = "押した時以外もマイク音声を録音し続け、10分ごとに音声アーカイブへ保存します（この Mac の外には出ません）"
         inputModeMenu.addItem(alwaysItem)
         let anyInputModeOn = seamlessModeActive || s.wakeWordEnabled || s.alwaysOnRecordingEnabled
-        let inputModeItem = NSMenuItem(title: anyInputModeOn ? "⚙︎ 入力モード ●" : "⚙︎ 入力モード", action: nil, keyEquivalent: "")
+        let inputModeItem = NSMenuItem(title: anyInputModeOn ? "🎙 入力モード ●" : "🎙 入力モード", action: nil, keyEquivalent: "")
         inputModeItem.submenu = inputModeMenu
         menu.addItem(inputModeItem)
-        menu.addItem(.separator())
 
         // LLMモード (翻訳ショートカットは設定で確認できるため、動作しないラベルは廃止)
         let modeMenu = NSMenu()
@@ -525,12 +531,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(modeItem)
         menu.addItem(.separator())
 
-        // ツール
+        // きく・おくる(声のツール): v3新機能=📻KOEラジオを筆頭に(既存ツールは全て保持)
+        // koe.live/live（24時間・本人声のAIラジオ）をそのまま聴ける小窓を開く
+        menu.addItem(withTitle: "📻 KOE ラジオ — LIVE", action: #selector(openKoeLive), keyEquivalent: "")
         let meetingTitle = MeetingMode.shared.isActive
             ? L10n.menuMeetingStop(count: MeetingMode.shared.entryCount)
             : L10n.menuMeetingStart
         menu.addItem(withTitle: meetingTitle, action: #selector(toggleMeetingMode), keyEquivalent: "m")
         menu.addItem(withTitle: L10n.menuFileTranscription, action: #selector(openFileTranscription), keyEquivalent: "t")
+        // 2026-07 簡略化: 翻訳/再認識ホットキーはデフォルトOFFにしたため、クリックだけで使える導線をここに用意
+        if !isRecording {
+            menu.addItem(withTitle: "🌐 翻訳して録音", action: #selector(startTranslateRecordingFromMenu), keyEquivalent: "")
+        }
+        if !isRecording, !isRecognizing, HistoryStore.shared.entries.first?.audioFileID != nil {
+            menu.addItem(withTitle: "↺ 直前の認識をやり直す", action: #selector(rerecognizeLast), keyEquivalent: "")
+        }
         // 声を送る: テキスト→クローン声→相手へメール（mcp.koe.live send_voice）。
         // 直前の音声入力が本文にプリフィルされる=「しゃべって、そのまま送る」。
         menu.addItem(withTitle: "🔊 声を送る…", action: #selector(openVoiceMessage), keyEquivalent: "")
@@ -561,14 +576,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
-        // ヘルプ: サポート + iPhone版案内をサブメニューに集約 (トップ階層の宣伝ノイズを除去)
+        // その他: ヘルプ / 設定 / 終了を1グループに(v3: グルーピング再編)
         let helpMenu = NSMenu()
-        helpMenu.addItem(withTitle: "❓ サポート", action: #selector(openSupport), keyEquivalent: "")
-        helpMenu.addItem(withTitle: "📱 iPhone版を入手 (TestFlight)", action: #selector(openTestFlight), keyEquivalent: "")
-        let helpItem = NSMenuItem(title: "ℹ︎ ヘルプ", action: nil, keyEquivalent: "")
+        helpMenu.addItem(withTitle: "サポート", action: #selector(openSupport), keyEquivalent: "")
+        helpMenu.addItem(withTitle: "iPhone版を入手 (TestFlight)", action: #selector(openTestFlight), keyEquivalent: "")
+        let helpItem = NSMenuItem(title: "❓ ヘルプ", action: nil, keyEquivalent: "")
         helpItem.submenu = helpMenu
         menu.addItem(helpItem)
-        menu.addItem(.separator())
         menu.addItem(withTitle: L10n.menuSettings, action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(withTitle: L10n.menuQuit, action: #selector(quit), keyEquivalent: "q")
         // 左クリック=読み上げにするため menu は常設せず保持だけ（右クリックで手動表示）
@@ -776,8 +790,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let settings = AppSettings.shared
             let isToggle = settings.recordingMode == .toggle
 
-            if hotKeyID.id == 1 || hotKeyID.id == 5 {
-                // メインホットキー or ⌘K pressed
+            if hotKeyID.id == 1 {
+                // メインホットキー pressed
                 DispatchQueue.main.async {
                     // 議事録自動録音中にホットキー → 自動録音を中断して手動録音に切替
                     if delegate.isRecording && delegate.isMeetingAutoRecording && MeetingMode.shared.isActive {
@@ -846,7 +860,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let delegate = AppDelegate.shared else { return noErr }
             let isToggle = AppSettings.shared.recordingMode == .toggle
 
-            if (hotKeyID.id == 1 || hotKeyID.id == 5) && !isToggle && delegate.isRecording {
+            if hotKeyID.id == 1 && !isToggle && delegate.isRecording {
                 delegate.stopAndRecognize()
             } else if hotKeyID.id == 2 && !isToggle && delegate.isRecording && delegate.isTranslateMode {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.0) {
@@ -866,12 +880,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         registerCarbonHotKeyRefs(settings: settings)
     }
 
-    /// 全 Carbon EventHotKey を解除（メイン・翻訳・⌃K・⌥⌘M・⌃⌥R・Space・ESC）。
+    /// 全 Carbon EventHotKey を解除（メイン・翻訳・⌥⌘M・⌃⌥R・Space・ESC）。
     /// teardown 用: deinit / applicationWillTerminate から呼ぶ。
     private func unregisterAllCarbonHotKeys() {
         if let ref = carbonHotKeyRef { UnregisterEventHotKey(ref); carbonHotKeyRef = nil }
         if let ref = carbonTranslateHotKeyRef { UnregisterEventHotKey(ref); carbonTranslateHotKeyRef = nil }
-        if let ref = carbonCmdKHotKeyRef { UnregisterEventHotKey(ref); carbonCmdKHotKeyRef = nil }
         if let ref = carbonMeetingHotKeyRef { UnregisterEventHotKey(ref); carbonMeetingHotKeyRef = nil }
         if let ref = carbonRerecognizeHotKeyRef { UnregisterEventHotKey(ref); carbonRerecognizeHotKeyRef = nil }
         if let ref = carbonSpaceHotKeyRef { UnregisterEventHotKey(ref); carbonSpaceHotKeyRef = nil }
@@ -925,7 +938,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// メイン・翻訳・⌃K・⌥⌘M・⌃⌥R のホットキー本体だけを登録。
+    /// メイン・翻訳・⌥⌘M・⌃⌥R のホットキー本体だけを登録。
+    /// 2026-07 簡略化（本人指示）: 録音トグル(メイン)だけがデフォルトで有効な唯一のホットキー。
+    /// 翻訳/議事録/再認識は settings.*HotkeyEnabled が true のときだけ登録する（デフォルトOFF）。
+    /// OFFの間もメニューバーのクリックから同じ機能を使える。⌃K（メインの単なる別名/機能重複）は廃止。
     /// イベントハンドラは別途インストール済みであることを前提とする。
     private func registerCarbonHotKeyRefs(settings: AppSettings) {
         // Carbon modifier変換
@@ -956,49 +972,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             klog("Carbon hotkey main: skipped (uses Fn — handled by FnKeyMonitor)")
         }
 
-        // 翻訳ホットキー登録（同上）
+        // 翻訳ホットキー登録（任意設定・デフォルトOFF — メニューの「🌐 翻訳して録音」が主導線）
         if let ref = carbonTranslateHotKeyRef { UnregisterEventHotKey(ref); carbonTranslateHotKeyRef = nil }
-        let transMods = carbonMods(NSEvent.ModifierFlags(rawValue: settings.translateHotkeyModifiers))
-        var transID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 2)
-        let transStatus = RegisterEventHotKey(UInt32(settings.translateHotkeyCode), transMods,
-                                               transID, GetApplicationEventTarget(), 0, &carbonTranslateHotKeyRef)
-        klog("Carbon hotkey translate: status=\(transStatus)")
-        if transStatus != noErr { failedHotkeys.append("⌥⌘T (翻訳)") }
-
-        // ⌃K ショートカット（追加のクイック起動キー）
-        if let ref = carbonCmdKHotKeyRef {
-            UnregisterEventHotKey(ref)
-            carbonCmdKHotKeyRef = nil
+        if settings.translateHotkeyEnabled {
+            let transMods = carbonMods(NSEvent.ModifierFlags(rawValue: settings.translateHotkeyModifiers))
+            var transID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 2)
+            let transStatus = RegisterEventHotKey(UInt32(settings.translateHotkeyCode), transMods,
+                                                   transID, GetApplicationEventTarget(), 0, &carbonTranslateHotKeyRef)
+            klog("Carbon hotkey translate: status=\(transStatus)")
+            if transStatus != noErr { failedHotkeys.append("⌥⌘T (翻訳)") }
+        } else {
+            klog("Carbon hotkey translate: disabled (opt-in, off by default)")
         }
-        var ctrlKID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 5)
-        let ctrlKStatus = RegisterEventHotKey(UInt32(kVK_ANSI_K), UInt32(controlKey),
-                                               ctrlKID, GetApplicationEventTarget(), 0, &carbonCmdKHotKeyRef)
-        klog("Carbon hotkey ⌃K: status=\(ctrlKStatus)")
-        if ctrlKStatus != noErr { failedHotkeys.append("⌃K") }
 
-        // ⌥⌘M 議事録トグル
+        // ⌥⌘M 議事録トグル（任意設定・デフォルトOFF — メニューの議事録開始/終了が主導線）
         if let ref = carbonMeetingHotKeyRef {
             UnregisterEventHotKey(ref)
             carbonMeetingHotKeyRef = nil
         }
-        var meetingID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 6)
-        let meetingStatus = RegisterEventHotKey(UInt32(kVK_ANSI_M),
-                                                 UInt32(cmdKey | optionKey),
-                                                 meetingID, GetApplicationEventTarget(), 0, &carbonMeetingHotKeyRef)
-        klog("Carbon hotkey ⌥⌘M: status=\(meetingStatus)")
-        if meetingStatus != noErr { failedHotkeys.append("⌥⌘M (議事録)") }
+        if settings.meetingHotkeyEnabled {
+            var meetingID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 6)
+            let meetingStatus = RegisterEventHotKey(UInt32(kVK_ANSI_M),
+                                                     UInt32(cmdKey | optionKey),
+                                                     meetingID, GetApplicationEventTarget(), 0, &carbonMeetingHotKeyRef)
+            klog("Carbon hotkey ⌥⌘M: status=\(meetingStatus)")
+            if meetingStatus != noErr { failedHotkeys.append("⌥⌘M (議事録)") }
+        } else {
+            klog("Carbon hotkey ⌥⌘M: disabled (opt-in, off by default)")
+        }
 
-        // ⌃⌥R 直前の認識をやり直す
+        // ⌃⌥R 直前の認識をやり直す（任意設定・デフォルトOFF — メニューの「↺ 直前の認識をやり直す」が主導線）
         if let ref = carbonRerecognizeHotKeyRef {
             UnregisterEventHotKey(ref)
             carbonRerecognizeHotKeyRef = nil
         }
-        var rerecID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 7)
-        let rerecStatus = RegisterEventHotKey(UInt32(kVK_ANSI_R),
-                                               UInt32(controlKey | optionKey),
-                                               rerecID, GetApplicationEventTarget(), 0, &carbonRerecognizeHotKeyRef)
-        klog("Carbon hotkey ⌃⌥R: status=\(rerecStatus)")
-        if rerecStatus != noErr { failedHotkeys.append("⌃⌥R (再認識)") }
+        if settings.rerecognizeHotkeyEnabled {
+            var rerecID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 7)
+            let rerecStatus = RegisterEventHotKey(UInt32(kVK_ANSI_R),
+                                                   UInt32(controlKey | optionKey),
+                                                   rerecID, GetApplicationEventTarget(), 0, &carbonRerecognizeHotKeyRef)
+            klog("Carbon hotkey ⌃⌥R: status=\(rerecStatus)")
+            if rerecStatus != noErr { failedHotkeys.append("⌃⌥R (再認識)") }
+        } else {
+            klog("Carbon hotkey ⌃⌥R: disabled (opt-in, off by default)")
+        }
 
         // 起動後初回の register で失敗があれば NSAlert で通知（reregisterHotkey 経由の再登録時は alert 出さず log のみ）
         if !failedHotkeys.isEmpty && !didShowFirstHotkeyAlert {
@@ -1086,7 +1103,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Translation hotkey (toggle mode: press to start, press again to stop)
-            if event.keyCode == transCode, !event.isARepeat {
+            // 任意設定・デフォルトOFF（本人指示 2026-07-16: メニューの「🌐 翻訳して録音」が主導線）
+            if settings.translateHotkeyEnabled, event.keyCode == transCode, !event.isARepeat {
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if flags == transMods {
                     DispatchQueue.main.async {
@@ -1234,6 +1252,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func startRecording() {
         // Stop wake word detector before AVAudioRecorder starts to avoid conflicts
         WakeWordDetector.shared.stop()
+
+        // このセッションが「ヘイ、Koe」起動かを確定させ、pendingフラグは即消費(以後の中断パスでの残留を防ぐ)
+        recognitionWakeTriggered = wakeTriggeredThisSession
+        wakeTriggeredThisSession = false
 
         // 録音中はシステム音量を下げる（マイクへの音漏れ防止）
         duckSystemVolume()
@@ -1557,6 +1579,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             formatted = VoiceCommands.applyPunctuationStyle(formatted, style: style)
         }
 
+        // 🎙「ヘイ、Koe」ウェイクワード起動 → koe.live/agentと同じKoeエージェント(Claude+MCP)へ。
+        // タイプ入力/ローカルAgentMode/議事録コマンド等はスキップ(ウェイクワードは常にエージェント宛の発話)
+        if recognitionWakeTriggered {
+            recognitionWakeTriggered = false
+            klog("KoeAgent(wake): '\(formatted.prefix(80))'")
+            HistoryStore.shared.add("[ヘイKoe] \(formatted)", audioFileID: lastArchiveID)
+            overlay?.hide()
+            KoeAgentBridge.shared.send(formatted, voiceID: "") { [weak self] message in
+                self?.sendNotification(text: message)
+            }
+            postRecognitionCleanup()
+            return
+        }
+
         // 議事録音声コマンド: 「ここ重要」等
         if MeetingMode.shared.isActive, let meetingCmd = VoiceCommands.detectMeetingCommand(formatted) {
             switch meetingCmd {
@@ -1845,8 +1881,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// ⌃⌥R: 直前の認識を現在のモデルで再認識してテキストを置換
-    func rerecognizeLast() {
+    /// ⌃⌥R (任意設定) / メニュー「↺ 直前の認識をやり直す」: 直前の認識を現在のモデルで再認識してテキストを置換
+    @objc func rerecognizeLast() {
         guard !isRecording, !isRecognizing else { return }
         guard let entry = HistoryStore.shared.entries.first,
               let fid = entry.audioFileID,
@@ -2649,9 +2685,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    /// 🌐 翻訳して録音 — メニューからのクリックで翻訳モード付き録音を開始する。
+    /// 2026-07 簡略化（本人指示）: 翻訳ホットキー(⌥⌘T)はデフォルトOFFにしたため、
+    /// Carbon ホットキー(id==2)ハンドラと同じ開始ロジックをここに用意。
+    @objc private func startTranslateRecordingFromMenu() {
+        guard !isRecording else { return }
+        isTranslateMode = true
+        overlay?.setTranslateMode(true)
+        klog("Translate mode: ON (menu)")
+        startRecording()
+    }
+
     /// 💬 メッセージ (Web) — koe.live/app（統合Webアプリ）をウィンドウで開く。
     @objc private func openKoeWebApp() {
         KoeWebWindow.shared.show()
+    }
+
+    /// 📻 KOE ラジオ — koe.live/live（24時間・本人声のAIラジオ）をウィンドウで開く(v3新機能)。
+    @objc private func openKoeLive() {
+        KoeLiveWindow.shared.show()
     }
 
     /// 🔊 声を送る — テキスト→クローン声→相手へメール（VoiceMessageWindow）。

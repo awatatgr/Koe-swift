@@ -263,6 +263,13 @@ class AppSettings: ObservableObject {
     @Published var translateHotkeyModifiers: UInt { didSet { ud.set(Int(bitPattern: translateHotkeyModifiers), forKey: "translateHotkeyModifiers") } }
     @Published var translateTargetLang: String { didSet { ud.set(translateTargetLang, forKey: "translateTargetLang") } }
 
+    // 2026-07: ホットキー簡略化（本人指示）— 録音トグル1つを主役にし、翻訳/議事録/再認識の
+    // 各ホットキーは任意設定・デフォルトOFFに。OFFの間もメニューバーからクリックで使える。
+    // Reregister が必要なので AppDelegate.reregisterHotkey() を呼ぶのは Settings UI 側の責務。
+    @Published var translateHotkeyEnabled: Bool   { didSet { ud.set(translateHotkeyEnabled, forKey: "translateHotkeyEnabled") } }
+    @Published var meetingHotkeyEnabled: Bool     { didSet { ud.set(meetingHotkeyEnabled, forKey: "meetingHotkeyEnabled") } }
+    @Published var rerecognizeHotkeyEnabled: Bool { didSet { ud.set(rerecognizeHotkeyEnabled, forKey: "rerecognizeHotkeyEnabled") } }
+
     // Recognition
     @Published var language: String          { didSet { ud.set(language,               forKey: "language"); AppDelegate.shared?.reloadSpeechEngine() } }
 
@@ -616,6 +623,10 @@ class AppSettings: ObservableObject {
         let savedLang = ud.string(forKey: "language") ?? "ja-JP"
         let defaultTarget = savedLang.hasPrefix("ja") ? "en" : "ja"
         translateTargetLang = ud.string(forKey: "translateTargetLang") ?? defaultTarget
+        // 副次ホットキー: デフォルトOFF（メニューバーからのクリックが主導線 / 本人指示 2026-07-16）
+        translateHotkeyEnabled   = ud.object(forKey: "translateHotkeyEnabled") as? Bool ?? false
+        meetingHotkeyEnabled     = ud.object(forKey: "meetingHotkeyEnabled") as? Bool ?? false
+        rerecognizeHotkeyEnabled = ud.object(forKey: "rerecognizeHotkeyEnabled") as? Bool ?? false
 
         language          = savedLang
         menuBarLanguageCodes = (ud.data(forKey: "menuBarLanguageCodes").flatMap { try? JSONDecoder().decode([String].self, from: $0) })
