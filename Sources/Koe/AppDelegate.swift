@@ -718,10 +718,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard settings.fnKeyEnabled else { return }
             self.fnTriggerToggle()
         }
-        // hold_ptt: Fn 押下開始 → 録音開始
+        // hold_ptt: Fn 押下開始 → 録音開始。ただし会話モード時は「押した瞬間に
+        // コックピットへ出入り」を優先する（会話セッションは複数ターンを自前で管理する
+        // ので hold-to-talk の粒度と合わない。解放は onFnHoldEnd の isRecording ガードで
+        // 素通りするため何も起きない）。
         monitor.onFnHoldStart = { [weak self] in
             guard let self else { return }
-            guard settings.fnKeyEnabled, !self.isRecording else { return }
+            guard settings.fnKeyEnabled else { return }
+            if self.enterConversationCockpitIfEnabled(reason: "fnkey") { return }
+            guard !self.isRecording else { return }
             self.isMeetingAutoRecording = false
             self.mainKeyHeld = true
             self.startRecording()
@@ -741,8 +746,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.start()
     }
 
+    /// conversationMode が ON なら会話コックピット（PC 全体を声で操縦するモード）へ
+    /// 出入りし true を返す。Fn もメインホットキー ⌥⌘V も同じ1箇所を通すことで、
+    /// 入口ごとにトグルロジックが枝分かれしない。reason は endSession のログ用
+    /// （どの入口で閉じたか）。会話モードが OFF なら false を返し、呼び出し側は
+    /// 素の録音／ディクテーションへ進む。
+    @discardableResult
+    fileprivate func enterConversationCockpitIfEnabled(reason: String) -> Bool {
+        guard AppSettings.shared.conversationModeEnabled else { return false }
+        if ConversationSession.shared.isActive {
+            ConversationSession.shared.endSession(reason: reason)
+        } else {
+            ConversationSession.shared.handleWakeDetected()
+        }
+        return true
+    }
+
     /// Fn 経由で発火する録音トグル (Carbon ハンドラの main hotkey 分岐と同等の挙動)。
     fileprivate func fnTriggerToggle() {
+        if enterConversationCockpitIfEnabled(reason: "fnkey") { return }
         let settings = AppSettings.shared
         let isToggle = settings.recordingMode == .toggle
         if isRecording && isMeetingAutoRecording && MeetingMode.shared.isActive {
@@ -784,14 +806,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // 継続会話セッション: conversationMode 時はホットキーで音声モードに出入りする。
                     // wake の常時マイクが VPIO と競合して使えないため、確実な入口として提供。
                     // 各ターンは startRecording（実績ある録音経路）を使うので確実に動く。
-                    if AppSettings.shared.conversationModeEnabled {
-                        if ConversationSession.shared.isActive {
-                            ConversationSession.shared.endSession(reason: "hotkey")
-                        } else {
-                            ConversationSession.shared.handleWakeDetected()
-                        }
-                        return
-                    }
+                    // Fn キーと同じ1箇所を通す（トグルロジックを二重に持たない）。
+                    if delegate.enterConversationCockpitIfEnabled(reason: "hotkey") { return }
                     // 議事録自動録音中にホットキー → 自動録音を中断して手動録音に切替
                     if delegate.isRecording && delegate.isMeetingAutoRecording && MeetingMode.shared.isActive {
                         delegate.cancelRecording()
