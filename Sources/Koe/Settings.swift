@@ -269,6 +269,8 @@ class AppSettings: ObservableObject {
     @Published var translateHotkeyEnabled: Bool   { didSet { ud.set(translateHotkeyEnabled, forKey: "translateHotkeyEnabled") } }
     @Published var meetingHotkeyEnabled: Bool     { didSet { ud.set(meetingHotkeyEnabled, forKey: "meetingHotkeyEnabled") } }
     @Published var rerecognizeHotkeyEnabled: Bool { didSet { ud.set(rerecognizeHotkeyEnabled, forKey: "rerecognizeHotkeyEnabled") } }
+    /// 🎙 ボイスレコーダーはVoiceMemos置き換えの主機能のため、他の副次ホットキーと違いデフォルトON。
+    @Published var voiceRecorderHotkeyEnabled: Bool { didSet { ud.set(voiceRecorderHotkeyEnabled, forKey: "voiceRecorderHotkeyEnabled") } }
 
     // Recognition
     @Published var language: String          { didSet { ud.set(language,               forKey: "language"); AppDelegate.shared?.reloadSpeechEngine() } }
@@ -627,6 +629,7 @@ class AppSettings: ObservableObject {
         translateHotkeyEnabled   = ud.object(forKey: "translateHotkeyEnabled") as? Bool ?? false
         meetingHotkeyEnabled     = ud.object(forKey: "meetingHotkeyEnabled") as? Bool ?? false
         rerecognizeHotkeyEnabled = ud.object(forKey: "rerecognizeHotkeyEnabled") as? Bool ?? false
+        voiceRecorderHotkeyEnabled = ud.object(forKey: "voiceRecorderHotkeyEnabled") as? Bool ?? true
 
         language          = savedLang
         menuBarLanguageCodes = (ud.data(forKey: "menuBarLanguageCodes").flatMap { try? JSONDecoder().decode([String].self, from: $0) })

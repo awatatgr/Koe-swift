@@ -10,9 +10,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var shared: AppDelegate?
 
     private var statusItem: NSStatusItem!
-    /// rebuildMenu() で組んだメニューの保持先。左クリック=読み上げにするため
-    /// statusItem.menu には常設せず、右クリック時だけ手動でポップアップする。
-    private var statusMenu: NSMenu?
     /// 本人声(ネット/鍵)が使えない時のオフライン保険。これがあるので「誰でも」必ず声が出る。
     private let systemSpeech = AVSpeechSynthesizer()
     private var overlay: OverlayWindow?
@@ -29,6 +26,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var carbonEscHotKeyRef: EventHotKeyRef?
     private var carbonMeetingHotKeyRef: EventHotKeyRef?
     private var carbonRerecognizeHotKeyRef: EventHotKeyRef?
+    private var carbonVoiceRecorderHotKeyRef: EventHotKeyRef?
     private var carbonEventHandlerRef: EventHandlerRef?
     private var carbonEventHandlerUpRef: EventHandlerRef?
     private var carbonHandlersInstalled = false
@@ -37,6 +35,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var meetingChatWindow: MeetingChatWindow?
     private var levelTimer: Timer?
     private var isRecording      = false
+    /// 🎙 ボイスレコーダー(VoiceMemoRecorder)がディクテーション排他判定に使う読み取り専用ゲート。
+    var isDictationRecordingActive: Bool { isRecording }
     private var recordingStart:  Date?
     private var activeAppBundleID = ""
     // 🎙 ウェイクワード(「ヘイ、Koe」)検出直後〜次の録音開始までの一時フラグ(startRecordingで即消費)
@@ -439,7 +439,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.toolTip = "Koe — クリックで読み上げ / 右クリックでメニュー"
+        statusItem.button?.toolTip = "Koe — クリックでメニュー"
         setIcon(recording: false)
         rebuildMenu()
 
@@ -449,12 +449,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // DropDelegateをretainしておく
         objc_setAssociatedObject(statusItem.button!, "dropDelegate", dropDelegate, .OBJC_ASSOCIATION_RETAIN)
         statusItem.button?.wantsLayer = true
-
-        // クリックで即・本人声で読み上げ（選択テキスト→クリップボード→直近認識結果）。
-        // 左クリック=読み上げ / 右クリック・Control+クリック=メニュー。
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(statusItemClicked)
-        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         // 設定に応じて可視性を適用
         updateStatusItemVisibility()
@@ -534,6 +528,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // きく・おくる(声のツール): v3新機能=📻KOEラジオを筆頭に(既存ツールは全て保持)
         // koe.live/live（24時間・本人声のAIラジオ）をそのまま聴ける小窓を開く
         menu.addItem(withTitle: "📻 KOE ラジオ — LIVE", action: #selector(openKoeLive), keyEquivalent: "")
+        // 🎙 ボイスレコーダー: Apple標準ボイスメモの置き換え。日常導線としてトップ階層1クリックで届くこと。
+        // 表示ショートカットはグローバルホットキー(⌥⌘R, registerCarbonHotKeyRefs)と一致させる。
+        let recorderItem = NSMenuItem(title: "🎙 ボイスレコーダー", action: #selector(openVoiceRecorder), keyEquivalent: "r")
+        recorderItem.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(recorderItem)
         let meetingTitle = MeetingMode.shared.isActive
             ? L10n.menuMeetingStop(count: MeetingMode.shared.entryCount)
             : L10n.menuMeetingStart
@@ -546,14 +545,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !isRecording, !isRecognizing, HistoryStore.shared.entries.first?.audioFileID != nil {
             menu.addItem(withTitle: "↺ 直前の認識をやり直す", action: #selector(rerecognizeLast), keyEquivalent: "")
         }
+        // 声のツール: 読み上げ/声を送る/メッセージ(Web) を1サブメニューに集約(トップ階層のボタン削減)
+        let voiceToolsMenu = NSMenu()
+        // 自分の声で読み上げ: 何を読むか選んでから、本人声クローンで合成して再生
+        voiceToolsMenu.addItem(withTitle: "🗣 自分の声で読み上げ…", action: #selector(openSpeakMyVoiceWindow), keyEquivalent: "r")
         // 声を送る: テキスト→クローン声→相手へメール（mcp.koe.live send_voice）。
         // 直前の音声入力が本文にプリフィルされる=「しゃべって、そのまま送る」。
-        menu.addItem(withTitle: "🔊 声を送る…", action: #selector(openVoiceMessage), keyEquivalent: "")
+        voiceToolsMenu.addItem(withTitle: "🔊 声を送る…", action: #selector(openVoiceMessage), keyEquivalent: "")
         // メッセージ(Web): koe.live/app（統合Webアプリ＝受信箱/焚き火/設定BYOK/通話）をウィンドウで開く
-        menu.addItem(withTitle: "💬 メッセージ (Web)", action: #selector(openKoeWebApp), keyEquivalent: "")
-        // 自分の声で読み上げ: 選択テキスト(なければクリップボード/直近の認識結果)を
-        // m5 の Qwen3-TTS 本人声クローンで合成して再生（クラウド不使用）
-        menu.addItem(withTitle: "🗣 自分の声で読み上げ", action: #selector(speakWithMyVoice), keyEquivalent: "r")
+        voiceToolsMenu.addItem(withTitle: "💬 メッセージ (Web)", action: #selector(openKoeWebApp), keyEquivalent: "")
+        let voiceToolsItem = NSMenuItem(title: "🗣 声のツール", action: nil, keyEquivalent: "")
+        voiceToolsItem.submenu = voiceToolsMenu
+        menu.addItem(voiceToolsItem)
         menu.addItem(.separator())
 
         // 最近の認識結果（クリックでコピー）
@@ -585,8 +588,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(helpItem)
         menu.addItem(withTitle: L10n.menuSettings, action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(withTitle: L10n.menuQuit, action: #selector(quit), keyEquivalent: "q")
-        // 左クリック=読み上げにするため menu は常設せず保持だけ（右クリックで手動表示）
-        statusMenu = menu
+        statusItem.menu = menu
     }
 
     func setIcon(recording: Bool) {
@@ -839,6 +841,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else if hotKeyID.id == 7 {
                 // ⌃⌥R pressed → 直前の認識をやり直す
                 DispatchQueue.main.async { delegate.rerecognizeLast() }
+            } else if hotKeyID.id == 8 {
+                // ⌥⌘R pressed → 🎙 ボイスレコーダーを開いて録音トグル(どこからでも一発キャプチャ)
+                DispatchQueue.main.async { VoiceRecorderWindow.shared.toggleViaHotkey() }
             } else if hotKeyID.id == 4 {
                 // ESC pressed → キャンセル
                 DispatchQueue.main.async {
@@ -887,6 +892,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let ref = carbonTranslateHotKeyRef { UnregisterEventHotKey(ref); carbonTranslateHotKeyRef = nil }
         if let ref = carbonMeetingHotKeyRef { UnregisterEventHotKey(ref); carbonMeetingHotKeyRef = nil }
         if let ref = carbonRerecognizeHotKeyRef { UnregisterEventHotKey(ref); carbonRerecognizeHotKeyRef = nil }
+        if let ref = carbonVoiceRecorderHotKeyRef { UnregisterEventHotKey(ref); carbonVoiceRecorderHotKeyRef = nil }
         if let ref = carbonSpaceHotKeyRef { UnregisterEventHotKey(ref); carbonSpaceHotKeyRef = nil }
         if let ref = carbonEscHotKeyRef { UnregisterEventHotKey(ref); carbonEscHotKeyRef = nil }
         if let h = carbonEventHandlerRef { RemoveEventHandler(h); carbonEventHandlerRef = nil }
@@ -1015,6 +1021,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if rerecStatus != noErr { failedHotkeys.append("⌃⌥R (再認識)") }
         } else {
             klog("Carbon hotkey ⌃⌥R: disabled (opt-in, off by default)")
+        }
+
+        // ⌥⌘R 🎙 ボイスレコーダー（デフォルトON — VoiceMemos置き換えの主機能なので他と違いopt-out方式）
+        if let ref = carbonVoiceRecorderHotKeyRef {
+            UnregisterEventHotKey(ref)
+            carbonVoiceRecorderHotKeyRef = nil
+        }
+        if settings.voiceRecorderHotkeyEnabled {
+            var recorderID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 8)
+            let recorderStatus = RegisterEventHotKey(UInt32(kVK_ANSI_R),
+                                                      UInt32(cmdKey | optionKey),
+                                                      recorderID, GetApplicationEventTarget(), 0, &carbonVoiceRecorderHotKeyRef)
+            klog("Carbon hotkey ⌥⌘R (ボイスレコーダー): status=\(recorderStatus)")
+            if recorderStatus != noErr { failedHotkeys.append("⌥⌘R (ボイスレコーダー)") }
+        } else {
+            klog("Carbon hotkey ⌥⌘R: disabled by user setting")
         }
 
         // 起動後初回の register で失敗があれば NSAlert で通知（reregisterHotkey 経由の再登録時は alert 出さず log のみ）
@@ -1250,6 +1272,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Recording
 
     private func startRecording() {
+        // 🎙 ボイスレコーダーが録音中はディクテーション録音を開始しない(マイク取り合い防止)
+        guard !VoiceMemoRecorder.shared.isRecording else {
+            klog("startRecording: blocked, VoiceMemoRecorder is active")
+            return
+        }
         // Stop wake word detector before AVAudioRecorder starts to avoid conflicts
         WakeWordDetector.shared.stop()
 
@@ -2480,25 +2507,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    /// 🗣 自分の声で読み上げ: 選択テキスト → クリップボード → 直近の認識結果 の順で対象を決め、
-    /// koe-mcp (https://mcp.koe.live/mcp) の `speak` ツールへ HTTP(JSON-RPC) で本人声クローン合成を依頼して再生する。
-    /// (旧 SSH 経由 `ssh m5 → koe_say.py` は廃止済み。実装は MyVoiceTTS.shared.speak)
-    /// メニューバーアイコンのクリック処理。
-    /// 左クリック=本人声で読み上げ / 右クリック・Control+クリック=メニュー。
-    @objc private func statusItemClicked() {
-        let event = NSApp.currentEvent
-        let wantsMenu = event?.type == .rightMouseUp
-            || event?.modifierFlags.contains(.control) == true
-        if wantsMenu {
-            guard let menu = statusMenu else { return }
-            statusItem.menu = menu
-            statusItem.button?.performClick(nil)  // メニューをポップアップ
-            statusItem.menu = nil                 // 次の左クリックで action が呼ばれるよう解除
-        } else {
-            speakWithMyVoice()  // 選択テキスト→クリップボード→直近認識結果 を本人声で
-        }
+    /// メニュー「🗣 自分の声で読み上げ…」— 何を読むか選べる小窓を開く(SpeakMyVoiceWindow)。
+    @objc private func openSpeakMyVoiceWindow() {
+        SpeakMyVoiceWindow.shared.show()
     }
 
+    /// 🗣 自分の声で読み上げ (自動化用・無確認): 選択テキスト → クリップボード → 直近の認識結果 の順で対象を決め、
+    /// koe-mcp (https://mcp.koe.live/mcp) の `speak` ツールへ HTTP(JSON-RPC) で本人声クローン合成を依頼して再生する。
+    /// (旧 SSH 経由 `ssh m5 → koe_say.py` は廃止済み。実装は MyVoiceTTS.shared.speak)
+    /// Shortcuts.app からの `koe://speak` (text 省略時) のみが呼ぶ。手動操作は openSpeakMyVoiceWindow() 経由。
     @objc func speakWithMyVoice() {
         var text = ""
         // 1. アクセシビリティで選択テキスト
@@ -2709,6 +2726,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// 🔊 声を送る — テキスト→クローン声→相手へメール（VoiceMessageWindow）。
     @objc private func openVoiceMessage() {
         VoiceMessageWindow.shared.show()
+    }
+
+    /// 🎙 ボイスレコーダー — Apple標準ボイスメモの置き換え(v3新機能)。
+    @objc private func openVoiceRecorder() {
+        VoiceRecorderWindow.shared.show()
     }
 
     @objc private func openFileTranscription() {
