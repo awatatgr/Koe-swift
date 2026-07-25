@@ -33,7 +33,7 @@ struct KoeApp: App {
                     set: { if !$0 { appState.incomingCallRoomID = nil } }
                 )) {
                     if let roomId = appState.incomingCallRoomID,
-                       let url = URL(string: "https://koe.live/t/\(roomId)") {
+                       let url = URL(string: "https://koe.live/t/\(roomId)?auto=1") {
                         ZStack(alignment: .topTrailing) {
                             WebAppView(url: url).ignoresSafeArea()
                             Button {
