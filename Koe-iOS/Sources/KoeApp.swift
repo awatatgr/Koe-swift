@@ -58,11 +58,13 @@ struct MainTabView: View {
     @StateObject private var sharedRecorder = RecordingManager()
 
     var body: some View {
+        // 🎛 5→3タブに整理(2026-07-25本人指示「よくわかんないアプリに感じる」→ペルソナレビュー)。
+        // 「履歴」「通話」は独立タブをやめ、設定タブの中のセクションへ格下げ(機能は削らない)。
         TabView(selection: $appState.selectedTab) {
             ContentView()
                 .tabItem {
                     Image(systemName: "mic.fill")
-                    Text("Koe")
+                    Text("話す")
                 }
                 .tag(0)
 
@@ -75,33 +77,17 @@ struct MainTabView: View {
                     .tag(10)
             }
 
-            HistoryView(recorder: sharedRecorder)
-                .tabItem {
-                    Image(systemName: "clock")
-                    Text("履歴")
-                }
-                .tag(1)
-
-            NavigationView {
-                CallTranscriberView()
-            }
-            .tabItem {
-                Image(systemName: "phone.fill")
-                Text("通話")
-            }
-            .tag(3)
-
             WebAppScreen()
                 .tabItem {
                     Image(systemName: "bubble.left.and.bubble.right.fill")
-                    Text("メッセージ")
+                    Text("つながる")
                 }
                 .tag(4)
 
-            MoreView()
+            MoreView(recorder: sharedRecorder)
                 .tabItem {
-                    Image(systemName: "ellipsis.circle")
-                    Text("More")
+                    Image(systemName: "gearshape.fill")
+                    Text("設定")
                 }
                 .tag(2)
         }

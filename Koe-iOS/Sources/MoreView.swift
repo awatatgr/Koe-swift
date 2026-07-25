@@ -49,6 +49,7 @@ private struct MenuRow<Destination: View>: View {
 }
 
 struct MoreView: View {
+    @ObservedObject var recorder: RecordingManager
     @StateObject private var modelManager = ModelManager.shared
     @ObservedObject private var macBridge = MacBridge.shared
     @AppStorage("koe_screen_context") private var screenContextEnabled = false
@@ -86,7 +87,7 @@ struct MoreView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Koe")
                                 .font(.title2.weight(.bold))
-                            Text("声で、もっと速く。")
+                            Text("あなたの声が、届く。")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                             Text("v\(appVersion)")
@@ -102,6 +103,24 @@ struct MoreView: View {
                     .padding(.vertical, 6)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
+                }
+
+                // MARK: - 文字起こし(履歴/詳細設定/通話) — 2026-07-25: 独立タブだった「履歴」「通話」をここに統合
+                Section {
+                    MenuRow(symbol: "clock.fill", color: .blue,
+                            title: "履歴", subtitle: "これまでの文字起こし") {
+                        HistoryView(recorder: recorder)
+                    }
+                    MenuRow(symbol: "slider.horizontal.3", color: .gray,
+                            title: "文字起こし設定", subtitle: "言語・AI補正・無音判定など") {
+                        SettingsView(recorder: recorder)
+                    }
+                    MenuRow(symbol: "phone.fill", color: .green,
+                            title: "通話の自動文字起こし", subtitle: "着信中の会話を書き起こす") {
+                        CallTranscriberView()
+                    }
+                } header: {
+                    Text("文字起こし")
                 }
 
                 // MARK: - 音声アシスタント

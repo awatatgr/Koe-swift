@@ -193,8 +193,8 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { appState.selectedTab = 1 } label: {
-                        Image(systemName: "dot.radiowaves.left.and.right")
+                    Button { appState.selectedTab = 2 } label: {
+                        Image(systemName: "clock")
                             .font(.subheadline)
                     }
                 }
