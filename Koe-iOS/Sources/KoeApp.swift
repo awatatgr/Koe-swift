@@ -77,7 +77,7 @@ struct MainTabView: View {
                     .tag(10)
             }
 
-            WebAppScreen()
+            ConnectView()
                 .tabItem {
                     Image(systemName: "bubble.left.and.bubble.right.fill")
                     Text("つながる")

@@ -48,6 +48,8 @@ targets:
         CLANG_CXX_LANGUAGE_STANDARD: "c++17"
     entitlements:
       path: Koe.entitlements
+      properties:
+        aps-environment: development
     dependencies:
       - target: KoeKeyboard
         embed: true
