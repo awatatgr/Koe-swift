@@ -491,6 +491,7 @@ struct ContentView: View {
                 }
 
                 // 本人の声で再生（話す→本人クローン声で読み上げ）
+                // 2026-07-25: アイコンのみだと気づかれないため、常時ラベルを添えて発見しやすくした。
                 Button {
                     switch tts.state {
                     case .loading, .playing:
@@ -499,18 +500,21 @@ struct ContentView: View {
                         Task { await tts.speakInMyVoice(recorder.recognizedText) }
                     }
                 } label: {
-                    Group {
-                        switch tts.state {
-                        case .loading:
-                            ProgressView().controlSize(.small)
-                        case .playing:
-                            Image(systemName: "waveform.circle.fill")
-                                .symbolEffect(.variableColor.iterative, options: .repeating)
-                        default:
-                            Image(systemName: "person.wave.2.fill")
+                    HStack(spacing: 4) {
+                        Group {
+                            switch tts.state {
+                            case .loading:
+                                ProgressView().controlSize(.small)
+                            case .playing:
+                                Image(systemName: "waveform.circle.fill")
+                                    .symbolEffect(.variableColor.iterative, options: .repeating)
+                            default:
+                                Image(systemName: "person.wave.2.fill")
+                            }
                         }
+                        .font(.system(size: 18))
+                        Text("声で聴く").font(.caption2.weight(.medium))
                     }
-                    .font(.system(size: 18))
                     .foregroundStyle(.orange)
                 }
                 .contextMenu {
