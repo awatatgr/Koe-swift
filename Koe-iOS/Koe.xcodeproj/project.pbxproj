@@ -16,6 +16,7 @@
 		2345DA7A81E7F551BC30EF16 /* WakeWordDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67DF02E93B8A617C32BF23A5 /* WakeWordDetector.swift */; };
 		23EB61FAE8D6C45F07528F27 /* MoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A3D60AF110C816648C690D3 /* MoreView.swift */; };
 		243C3C2EC6640051BCBA7684 /* FeedbackManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6307CCCAA55DCAA9A57176B3 /* FeedbackManager.swift */; };
+		26E70414135722ED4902B120 /* CallKitManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F454E302194F93F4226122ED /* CallKitManager.swift */; };
 		2C39265DF9AFB6BDE16BD28A /* HistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC0B1D6E09BEEC6A1E1D16FD /* HistoryView.swift */; };
 		33DA89D451994F38F8249DDB /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDAFCAEA0BD98C7F3E002895 /* KeychainHelper.swift */; };
 		35446E3B1F90BF07CE1B1D6F /* KoeShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8335D6BF37ED46929C1A99 /* KoeShortcuts.swift */; };
@@ -164,6 +165,7 @@
 		EB2CC2336D623EF52DD55F2D /* VoiceMemoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceMemoView.swift; sourceTree = "<group>"; };
 		EC0B1D6E09BEEC6A1E1D16FD /* HistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryView.swift; sourceTree = "<group>"; };
 		F25B6188B167F49D8EDFC746 /* VoiceMemoStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceMemoStore.swift; sourceTree = "<group>"; };
+		F454E302194F93F4226122ED /* CallKitManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallKitManager.swift; sourceTree = "<group>"; };
 		F7CE8E44AA229D153001F522 /* soluna_ring.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = soluna_ring.c; sourceTree = "<group>"; };
 		FB1A39FCF6B7C3BD815013F9 /* AudioInputManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioInputManager.swift; sourceTree = "<group>"; };
 		FD4D5F6DA042AA84A1B8A015 /* TextExpansionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextExpansionStore.swift; sourceTree = "<group>"; };
@@ -181,6 +183,7 @@
 				CF16A32B380CE3F4BF8EAEE4 /* AudioSessionCoordinator.swift */,
 				2A4369D20092F5F94274C8FC /* AudioToolsView.swift */,
 				5432797E704450F805B66F45 /* BLEAudioBridge.swift */,
+				F454E302194F93F4226122ED /* CallKitManager.swift */,
 				B1D392A1252DF53DE14EC5C6 /* CallTranscriber.swift */,
 				43F5C4DA6E8201D7270B8918 /* CallTranscriberView.swift */,
 				21E264AF883E006A40D11232 /* ContentView.swift */,
@@ -453,6 +456,7 @@
 				C2341077EA179E2118AA8C34 /* AudioSessionCoordinator.swift in Sources */,
 				494339B2D85E4EC36B6C42CB /* AudioToolsView.swift in Sources */,
 				C0FF94CE637A67DCE63CC491 /* BLEAudioBridge.swift in Sources */,
+				26E70414135722ED4902B120 /* CallKitManager.swift in Sources */,
 				03154D932B8AEA50E759FD43 /* CallTranscriber.swift in Sources */,
 				CFF652B15799A2EF5315461F /* CallTranscriberView.swift in Sources */,
 				C0F116F1B98F8CBD5A510780 /* ContentView.swift in Sources */,
@@ -563,7 +567,7 @@
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/lib";
 				MARKETING_VERSION = 1.4.0;
 				MTL_HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/Sources";
-				OTHER_LDFLAGS = "-lsoluna_core -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lstdc++ -framework Accelerate -framework Metal -framework MetalKit -framework CoreMotion -framework AudioToolbox -framework CallKit -framework EventKit";
+				OTHER_LDFLAGS = "-lsoluna_core -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lstdc++ -framework Accelerate -framework Metal -framework MetalKit -framework CoreMotion -framework AudioToolbox -framework CallKit -framework EventKit -framework PushKit";
 				PRODUCT_BUNDLE_IDENTIFIER = com.yuki.koe.ios;
 				SDKROOT = iphoneos;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
@@ -809,7 +813,7 @@
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/lib";
 				MARKETING_VERSION = 1.4.0;
 				MTL_HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/Sources";
-				OTHER_LDFLAGS = "-lsoluna_core -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lstdc++ -framework Accelerate -framework Metal -framework MetalKit -framework CoreMotion -framework AudioToolbox -framework CallKit -framework EventKit";
+				OTHER_LDFLAGS = "-lsoluna_core -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lstdc++ -framework Accelerate -framework Metal -framework MetalKit -framework CoreMotion -framework AudioToolbox -framework CallKit -framework EventKit -framework PushKit";
 				PRODUCT_BUNDLE_IDENTIFIER = com.yuki.koe.ios;
 				SDKROOT = iphoneos;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
