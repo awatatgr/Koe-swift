@@ -34,7 +34,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.yuki.koe.ios
         INFOPLIST_FILE: Info.plist
         MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "2"
+        CURRENT_PROJECT_VERSION: "3"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: true
@@ -42,12 +42,14 @@ targets:
         SWIFT_INCLUDE_PATHS: "$(PROJECT_DIR)/Sources/CWhisper $(PROJECT_DIR)/Sources/CSolunaRing"
         HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/Sources/include $(PROJECT_DIR)/Sources"
         LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/lib"
-        OTHER_LDFLAGS: "-lsoluna_core -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lstdc++ -framework Accelerate -framework Metal -framework MetalKit -framework CoreMotion -framework AudioToolbox -framework CallKit -framework EventKit"
+        OTHER_LDFLAGS: "-lsoluna_core -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lstdc++ -framework Accelerate -framework Metal -framework MetalKit -framework CoreMotion -framework AudioToolbox -framework CallKit -framework EventKit -framework PushKit"
         MTL_HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/Sources"
         GENERATE_INFOPLIST_FILE: "NO"
         CLANG_CXX_LANGUAGE_STANDARD: "c++17"
     entitlements:
       path: Koe.entitlements
+      properties:
+        aps-environment: development
     dependencies:
       - target: KoeKeyboard
         embed: true
@@ -67,7 +69,7 @@ targets:
         INFOPLIST_FILE: KoeKeyboard/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
         MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "2"
+        CURRENT_PROJECT_VERSION: "3"
         TARGETED_DEVICE_FAMILY: "1,2"
     entitlements:
       path: KoeKeyboard/KoeKeyboard.entitlements
@@ -83,7 +85,7 @@ targets:
         INFOPLIST_FILE: KoeShareExt/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
         MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "2"
+        CURRENT_PROJECT_VERSION: "3"
         TARGETED_DEVICE_FAMILY: "1,2"
     entitlements:
       path: KoeShareExt/KoeShareExt.entitlements
@@ -99,7 +101,7 @@ targets:
         INFOPLIST_FILE: KoeWidget/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
         MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "2"
+        CURRENT_PROJECT_VERSION: "3"
         TARGETED_DEVICE_FAMILY: "1,2"
     entitlements:
       path: KoeWidget/KoeWidget.entitlements

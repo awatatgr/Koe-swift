@@ -47,3 +47,5 @@ Koe-windows/target/
 *.mobileprovision
 *.p12
 *.cer
+lib-macos/prebuilt-dylibs/
+Koe-iOS/Sources/Secrets.swift

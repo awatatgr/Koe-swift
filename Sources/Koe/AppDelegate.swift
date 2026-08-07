@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Carbon.HIToolbox
 import Speech
 import UniformTypeIdentifiers
@@ -9,6 +10,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var shared: AppDelegate?
 
     private var statusItem: NSStatusItem!
+    /// 本人声(ネット/鍵)が使えない時のオフライン保険。これがあるので「誰でも」必ず声が出る。
+    private let systemSpeech = AVSpeechSynthesizer()
     private var overlay: OverlayWindow?
     private var settingsWC: SettingsWindowController?
     private var setupWindow: SetupWindow?
@@ -21,9 +24,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var carbonTranslateHotKeyRef: EventHotKeyRef?
     private var carbonSpaceHotKeyRef: EventHotKeyRef?
     private var carbonEscHotKeyRef: EventHotKeyRef?
-    private var carbonCmdKHotKeyRef: EventHotKeyRef?
     private var carbonMeetingHotKeyRef: EventHotKeyRef?
     private var carbonRerecognizeHotKeyRef: EventHotKeyRef?
+    private var carbonVoiceRecorderHotKeyRef: EventHotKeyRef?
     private var carbonEventHandlerRef: EventHandlerRef?
     private var carbonEventHandlerUpRef: EventHandlerRef?
     private var carbonHandlersInstalled = false
@@ -32,8 +35,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var meetingChatWindow: MeetingChatWindow?
     private var levelTimer: Timer?
     private var isRecording      = false
+    /// 🎙 ボイスレコーダー(VoiceMemoRecorder)がディクテーション排他判定に使う読み取り専用ゲート。
+    var isDictationRecordingActive: Bool { isRecording }
     private var recordingStart:  Date?
     private var activeAppBundleID = ""
+    // 🎙 ウェイクワード(「ヘイ、Koe」)検出直後〜次の録音開始までの一時フラグ(startRecordingで即消費)
+    private var wakeTriggeredThisSession = false
+    // startRecording時点で確定した「このセッションはウェイクワード起動か」。認識結果はタイプ入力/ローカルAgentModeでなく
+    // koe.live/agentと同じKoeエージェント(Claude+MCP)へ送る(2026-07-14本人指示)。中断パスをすべて追わなくて済むよう
+    // startRecordingで一度だけ確定させる設計(次のstartRecordingで上書きされるので明示的なリセットは不要)
+    private var recognitionWakeTriggered = false
 
     // Silence-based auto-stop (VAD: 直近フレームの平滑化で誤検出を低減)
     private let voiceThresholdBase: Float = 0.08  // 基本閾値（環境ノイズで動的に上昇）
@@ -46,7 +57,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let levelHistorySize = 4              // 4フレーム ≈ 133ms @ 30Hz
     /// 動的発話閾値: 環境ノイズの2倍 or 基本値のいずれか大きい方（上限0.25）
     private var voiceThreshold: Float { min(max(voiceThresholdBase, ambientNoiseLevel * 2.0), 0.25) }
-    private let maxRecordDuration: TimeInterval = 300  // 5分（whisper.cppは内部で30秒セグメントに分割処理）
+    // 録音時間の上限なし（v2.11〜）。whisper.cppは内部で30秒セグメントに分割処理するため
+    // 長時間でも認識可能。無音自動停止 (silenceAutoStop) が通常の止め忘れを防ぐ。
     /// 無音閾値: 最初から設定値をそのまま使用（後半の言葉を拾い損ねない）
     private var silenceAutoStop: TimeInterval {
         return AppSettings.shared.silenceAutoStopSeconds
@@ -64,9 +76,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Speculative execution
     private var speculativeResult: String? = nil
     private var speculationID = 0
+    // 投機の多重発火防止: updateSilenceDetection は 60fps で呼ばれるため、結果待ちの間に
+    // 同じ無音区間で何十回も whisper を起動しない (WAV生読みフォールバック後は1回が高コスト)
+    private var speculationInFlight = false
     // ストリーミング中の最新認識結果（投機とは独立）
     private var lastStreamingResult: String? = nil
-    private var lastStreamingSampleCount = 0
+    // Apple Speech ストリーミングのセグメント管理（〜1分でタスクが終了するため自動再開して無制限化）
+    private var streamingAccumulated = ""     // 終了したセグメントの確定テキスト
+    private var streamingSegmentText = ""     // 現在のセグメントの途中テキスト
+    private var lastStreamingRestart = Date.distantPast
+    private var streamingRapidRestartCount = 0
+    // 認識中セッションの途中結果ファイルID（postRecognitionCleanup で削除）
+    private var recognitionPartialID: UUID?
     // Apple Speechで先行入力したテキスト（whisper結果で置換用）
     private var appleSpechPreliminary: String? = nil
 
@@ -104,9 +125,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
+        trackEvent("app_launch")
         setupMenu()
         reregisterHotkey()
+
+        // クラッシュ/強制終了で残った録音・認識途中テキストを復旧。
+        // recorder.prepare() が新しい rec_*.wav を作る前に必ず実行する。
+        let recovered = CrashRecovery.run()
+        if !recovered.isEmpty {
+            scheduleRecoveredRetranscription(recovered, attempt: 0)
+        }
+
         recorder.prepare()
+
+        // 常時録音 (ON設定時): ホットキー以外の時間もバックグラウンド録音
+        if AppSettings.shared.alwaysOnRecordingEnabled {
+            AlwaysOnRecorder.shared.start()
+        }
 
         // マイク指向性を前方に設定 (ビームフォーミング)
         MicrophoneConfig.setFrontFacing()
@@ -302,7 +337,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        WakeWordDetector.shared.onDetected = { [weak self] in self?.startRecording() }
+        WakeWordDetector.shared.onDetected = { [weak self] in
+            self?.wakeTriggeredThisSession = true
+            self?.startRecording()
+        }
         if AppSettings.shared.wakeWordEnabled { WakeWordDetector.shared.start() }
         if AppSettings.shared.floatingButtonEnabled { FloatingButton.shared.show() }
 
@@ -383,9 +421,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         HistoryStore.shared.flushSync()
-        // 録音中に終了するとシステムデフォルト入力デバイスが選択 UID に固定されたままになる
-        // ので、cancel() で必ず restoreDefaultInputDevice() を通す
-        recorder.cancel()
+        // 録音中の終了でもデータを失わない: cancel() はファイルを削除するため使わない。
+        // shutdown() は録音を止めてファイルを残し (次回起動の CrashRecovery が回収)、
+        // システムデフォルト入力デバイスも復元する
+        recorder.shutdown()
+        // 常時録音の現在チャンクを確定保存
+        AlwaysOnRecorder.shared.stop()
         WhisperServer.shared.stop()
         WakeWordDetector.shared.stop()
         // Carbon の global hotkey / event handler を確実に解放
@@ -398,7 +439,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.toolTip = "Koe — 声で入力"
+        statusItem.button?.toolTip = "Koe — クリックでメニュー"
         setIcon(recording: false)
         rebuildMenu()
 
@@ -436,7 +477,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(hint)
         menu.addItem(.separator())
 
-        // 言語切替 (すべてサブメニューにまとめる)
+        // かく(入力): 言語 / 入力モード / LLMモードを1グループに(v3: グルーピング再編・機能は不変)
         let langSubMenu = NSMenu()
         for lang in s.menuBarLanguages + s.otherLanguages {
             let item = NSMenuItem(title: "\(lang.flag) \(lang.name)", action: #selector(selectLanguage(_:)), keyEquivalent: "")
@@ -448,22 +489,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let langItem = NSMenuItem(title: "\(s.languageFlag) \(currentLangName)", action: nil, keyEquivalent: "")
         langItem.submenu = langSubMenu
         menu.addItem(langItem)
-        menu.addItem(.separator())
 
-        // シームレスモード ON/OFF
+        // 入力モード: シームレス + ウェイクワードを 1 サブメニューに集約 (トップ階層のボタン削減)
+        let inputModeMenu = NSMenu()
         let seamlessTitle = seamlessModeActive ? "∞ シームレス: ON" : "∞ シームレス: OFF"
         let seamlessItem = NSMenuItem(title: seamlessTitle, action: #selector(toggleSeamlessModeMenu), keyEquivalent: "")
         seamlessItem.state = seamlessModeActive ? .on : .off
-        menu.addItem(seamlessItem)
-
-        // ウェイクワード ON/OFF
+        inputModeMenu.addItem(seamlessItem)
         let wakeTitle = s.wakeWordEnabled ? "🎙 ウェイクワード: ON" : "🔇 ウェイクワード: OFF"
         let wakeItem = NSMenuItem(title: wakeTitle, action: #selector(toggleWakeWordMenu), keyEquivalent: "")
         wakeItem.state = s.wakeWordEnabled ? .on : .off
-        menu.addItem(wakeItem)
-        menu.addItem(.separator())
+        inputModeMenu.addItem(wakeItem)
+        // 常時録音: ホットキー以外の時間もバックグラウンドで録音し続ける（完全ローカル）
+        let alwaysTitle = s.alwaysOnRecordingEnabled ? "⏺ 常時録音: ON" : "⏺ 常時録音: OFF"
+        let alwaysItem = NSMenuItem(title: alwaysTitle, action: #selector(toggleAlwaysOnRecording), keyEquivalent: "")
+        alwaysItem.state = s.alwaysOnRecordingEnabled ? .on : .off
+        alwaysItem.toolTip = "押した時以外もマイク音声を録音し続け、10分ごとに音声アーカイブへ保存します（この Mac の外には出ません）"
+        inputModeMenu.addItem(alwaysItem)
+        let anyInputModeOn = seamlessModeActive || s.wakeWordEnabled || s.alwaysOnRecordingEnabled
+        let inputModeItem = NSMenuItem(title: anyInputModeOn ? "🎙 入力モード ●" : "🎙 入力モード", action: nil, keyEquivalent: "")
+        inputModeItem.submenu = inputModeMenu
+        menu.addItem(inputModeItem)
 
-        // LLMモード
+        // LLMモード (翻訳ショートカットは設定で確認できるため、動作しないラベルは廃止)
         let modeMenu = NSMenu()
         for mode in LLMMode.allCases {
             let item = NSMenuItem(title: mode.displayName, action: #selector(selectLLMMode(_:)), keyEquivalent: "")
@@ -475,18 +523,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let modeItem = NSMenuItem(title: modeLabel, action: nil, keyEquivalent: "")
         modeItem.submenu = modeMenu
         menu.addItem(modeItem)
-
-        let transItem = NSMenuItem(title: "\(L10n.menuTranslation) \(s.translateShortcutDisplayString)", action: nil, keyEquivalent: "")
-        transItem.isEnabled = false
-        menu.addItem(transItem)
         menu.addItem(.separator())
 
-        // ツール
+        // きく・おくる(声のツール): v3新機能=📻KOEラジオを筆頭に(既存ツールは全て保持)
+        // koe.live/live（24時間・本人声のAIラジオ）をそのまま聴ける小窓を開く
+        menu.addItem(withTitle: "📻 KOE ラジオ — LIVE", action: #selector(openKoeLive), keyEquivalent: "")
+        // 🎙 ボイスレコーダー: Apple標準ボイスメモの置き換え。日常導線としてトップ階層1クリックで届くこと。
+        // 表示ショートカットはグローバルホットキー(⌥⌘R, registerCarbonHotKeyRefs)と一致させる。
+        let recorderItem = NSMenuItem(title: "🎙 ボイスレコーダー", action: #selector(openVoiceRecorder), keyEquivalent: "r")
+        recorderItem.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(recorderItem)
         let meetingTitle = MeetingMode.shared.isActive
             ? L10n.menuMeetingStop(count: MeetingMode.shared.entryCount)
             : L10n.menuMeetingStart
         menu.addItem(withTitle: meetingTitle, action: #selector(toggleMeetingMode), keyEquivalent: "m")
         menu.addItem(withTitle: L10n.menuFileTranscription, action: #selector(openFileTranscription), keyEquivalent: "t")
+        // 2026-07 簡略化: 翻訳/再認識ホットキーはデフォルトOFFにしたため、クリックだけで使える導線をここに用意
+        if !isRecording {
+            menu.addItem(withTitle: "🌐 翻訳して録音", action: #selector(startTranslateRecordingFromMenu), keyEquivalent: "")
+        }
+        if !isRecording, !isRecognizing, HistoryStore.shared.entries.first?.audioFileID != nil {
+            menu.addItem(withTitle: "↺ 直前の認識をやり直す", action: #selector(rerecognizeLast), keyEquivalent: "")
+        }
+        // 声のツール: 読み上げ/声を送る/メッセージ(Web) を1サブメニューに集約(トップ階層のボタン削減)
+        let voiceToolsMenu = NSMenu()
+        // 自分の声で読み上げ: 何を読むか選んでから、本人声クローンで合成して再生
+        voiceToolsMenu.addItem(withTitle: "🗣 自分の声で読み上げ…", action: #selector(openSpeakMyVoiceWindow), keyEquivalent: "r")
+        // 声を送る: テキスト→クローン声→相手へメール（mcp.koe.live send_voice）。
+        // 直前の音声入力が本文にプリフィルされる=「しゃべって、そのまま送る」。
+        voiceToolsMenu.addItem(withTitle: "🔊 声を送る…", action: #selector(openVoiceMessage), keyEquivalent: "")
+        // メッセージ(Web): koe.live/app（統合Webアプリ＝受信箱/焚き火/設定BYOK/通話）をウィンドウで開く
+        voiceToolsMenu.addItem(withTitle: "💬 メッセージ (Web)", action: #selector(openKoeWebApp), keyEquivalent: "")
+        let voiceToolsItem = NSMenuItem(title: "🗣 声のツール", action: nil, keyEquivalent: "")
+        voiceToolsItem.submenu = voiceToolsMenu
+        menu.addItem(voiceToolsItem)
         menu.addItem(.separator())
 
         // 最近の認識結果（クリックでコピー）
@@ -509,12 +579,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
-        menu.addItem(withTitle: "📱 iPhone版を入手 (TestFlight)", action: #selector(openTestFlight), keyEquivalent: "")
-        menu.addItem(withTitle: "❓ サポート", action: #selector(openSupport), keyEquivalent: "")
-        menu.addItem(.separator())
+        // その他: ヘルプ / 設定 / 終了を1グループに(v3: グルーピング再編)
+        let helpMenu = NSMenu()
+        helpMenu.addItem(withTitle: "サポート", action: #selector(openSupport), keyEquivalent: "")
+        helpMenu.addItem(withTitle: "iPhone版を入手 (TestFlight)", action: #selector(openTestFlight), keyEquivalent: "")
+        let helpItem = NSMenuItem(title: "❓ ヘルプ", action: nil, keyEquivalent: "")
+        helpItem.submenu = helpMenu
+        menu.addItem(helpItem)
         menu.addItem(withTitle: L10n.menuSettings, action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(withTitle: L10n.menuQuit, action: #selector(quit), keyEquivalent: "q")
-        statusItem?.menu = menu
+        statusItem.menu = menu
     }
 
     func setIcon(recording: Bool) {
@@ -718,8 +792,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let settings = AppSettings.shared
             let isToggle = settings.recordingMode == .toggle
 
-            if hotKeyID.id == 1 || hotKeyID.id == 5 {
-                // メインホットキー or ⌘K pressed
+            if hotKeyID.id == 1 {
+                // メインホットキー pressed
                 DispatchQueue.main.async {
                     // 議事録自動録音中にホットキー → 自動録音を中断して手動録音に切替
                     if delegate.isRecording && delegate.isMeetingAutoRecording && MeetingMode.shared.isActive {
@@ -767,6 +841,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else if hotKeyID.id == 7 {
                 // ⌃⌥R pressed → 直前の認識をやり直す
                 DispatchQueue.main.async { delegate.rerecognizeLast() }
+            } else if hotKeyID.id == 8 {
+                // ⌥⌘R pressed → 🎙 ボイスレコーダーを開いて録音トグル(どこからでも一発キャプチャ)
+                DispatchQueue.main.async { VoiceRecorderWindow.shared.toggleViaHotkey() }
             } else if hotKeyID.id == 4 {
                 // ESC pressed → キャンセル
                 DispatchQueue.main.async {
@@ -788,7 +865,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let delegate = AppDelegate.shared else { return noErr }
             let isToggle = AppSettings.shared.recordingMode == .toggle
 
-            if (hotKeyID.id == 1 || hotKeyID.id == 5) && !isToggle && delegate.isRecording {
+            if hotKeyID.id == 1 && !isToggle && delegate.isRecording {
                 delegate.stopAndRecognize()
             } else if hotKeyID.id == 2 && !isToggle && delegate.isRecording && delegate.isTranslateMode {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.0) {
@@ -808,14 +885,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         registerCarbonHotKeyRefs(settings: settings)
     }
 
-    /// 全 Carbon EventHotKey を解除（メイン・翻訳・⌃K・⌥⌘M・⌃⌥R・Space・ESC）。
+    /// 全 Carbon EventHotKey を解除（メイン・翻訳・⌥⌘M・⌃⌥R・Space・ESC）。
     /// teardown 用: deinit / applicationWillTerminate から呼ぶ。
     private func unregisterAllCarbonHotKeys() {
         if let ref = carbonHotKeyRef { UnregisterEventHotKey(ref); carbonHotKeyRef = nil }
         if let ref = carbonTranslateHotKeyRef { UnregisterEventHotKey(ref); carbonTranslateHotKeyRef = nil }
-        if let ref = carbonCmdKHotKeyRef { UnregisterEventHotKey(ref); carbonCmdKHotKeyRef = nil }
         if let ref = carbonMeetingHotKeyRef { UnregisterEventHotKey(ref); carbonMeetingHotKeyRef = nil }
         if let ref = carbonRerecognizeHotKeyRef { UnregisterEventHotKey(ref); carbonRerecognizeHotKeyRef = nil }
+        if let ref = carbonVoiceRecorderHotKeyRef { UnregisterEventHotKey(ref); carbonVoiceRecorderHotKeyRef = nil }
         if let ref = carbonSpaceHotKeyRef { UnregisterEventHotKey(ref); carbonSpaceHotKeyRef = nil }
         if let ref = carbonEscHotKeyRef { UnregisterEventHotKey(ref); carbonEscHotKeyRef = nil }
         if let h = carbonEventHandlerRef { RemoveEventHandler(h); carbonEventHandlerRef = nil }
@@ -867,7 +944,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// メイン・翻訳・⌃K・⌥⌘M・⌃⌥R のホットキー本体だけを登録。
+    /// メイン・翻訳・⌥⌘M・⌃⌥R のホットキー本体だけを登録。
+    /// 2026-07 簡略化（本人指示）: 録音トグル(メイン)だけがデフォルトで有効な唯一のホットキー。
+    /// 翻訳/議事録/再認識は settings.*HotkeyEnabled が true のときだけ登録する（デフォルトOFF）。
+    /// OFFの間もメニューバーのクリックから同じ機能を使える。⌃K（メインの単なる別名/機能重複）は廃止。
     /// イベントハンドラは別途インストール済みであることを前提とする。
     private func registerCarbonHotKeyRefs(settings: AppSettings) {
         // Carbon modifier変換
@@ -898,49 +978,66 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             klog("Carbon hotkey main: skipped (uses Fn — handled by FnKeyMonitor)")
         }
 
-        // 翻訳ホットキー登録（同上）
+        // 翻訳ホットキー登録（任意設定・デフォルトOFF — メニューの「🌐 翻訳して録音」が主導線）
         if let ref = carbonTranslateHotKeyRef { UnregisterEventHotKey(ref); carbonTranslateHotKeyRef = nil }
-        let transMods = carbonMods(NSEvent.ModifierFlags(rawValue: settings.translateHotkeyModifiers))
-        var transID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 2)
-        let transStatus = RegisterEventHotKey(UInt32(settings.translateHotkeyCode), transMods,
-                                               transID, GetApplicationEventTarget(), 0, &carbonTranslateHotKeyRef)
-        klog("Carbon hotkey translate: status=\(transStatus)")
-        if transStatus != noErr { failedHotkeys.append("⌥⌘T (翻訳)") }
-
-        // ⌃K ショートカット（追加のクイック起動キー）
-        if let ref = carbonCmdKHotKeyRef {
-            UnregisterEventHotKey(ref)
-            carbonCmdKHotKeyRef = nil
+        if settings.translateHotkeyEnabled {
+            let transMods = carbonMods(NSEvent.ModifierFlags(rawValue: settings.translateHotkeyModifiers))
+            var transID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 2)
+            let transStatus = RegisterEventHotKey(UInt32(settings.translateHotkeyCode), transMods,
+                                                   transID, GetApplicationEventTarget(), 0, &carbonTranslateHotKeyRef)
+            klog("Carbon hotkey translate: status=\(transStatus)")
+            if transStatus != noErr { failedHotkeys.append("⌥⌘T (翻訳)") }
+        } else {
+            klog("Carbon hotkey translate: disabled (opt-in, off by default)")
         }
-        var ctrlKID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 5)
-        let ctrlKStatus = RegisterEventHotKey(UInt32(kVK_ANSI_K), UInt32(controlKey),
-                                               ctrlKID, GetApplicationEventTarget(), 0, &carbonCmdKHotKeyRef)
-        klog("Carbon hotkey ⌃K: status=\(ctrlKStatus)")
-        if ctrlKStatus != noErr { failedHotkeys.append("⌃K") }
 
-        // ⌥⌘M 議事録トグル
+        // ⌥⌘M 議事録トグル（任意設定・デフォルトOFF — メニューの議事録開始/終了が主導線）
         if let ref = carbonMeetingHotKeyRef {
             UnregisterEventHotKey(ref)
             carbonMeetingHotKeyRef = nil
         }
-        var meetingID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 6)
-        let meetingStatus = RegisterEventHotKey(UInt32(kVK_ANSI_M),
-                                                 UInt32(cmdKey | optionKey),
-                                                 meetingID, GetApplicationEventTarget(), 0, &carbonMeetingHotKeyRef)
-        klog("Carbon hotkey ⌥⌘M: status=\(meetingStatus)")
-        if meetingStatus != noErr { failedHotkeys.append("⌥⌘M (議事録)") }
+        if settings.meetingHotkeyEnabled {
+            var meetingID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 6)
+            let meetingStatus = RegisterEventHotKey(UInt32(kVK_ANSI_M),
+                                                     UInt32(cmdKey | optionKey),
+                                                     meetingID, GetApplicationEventTarget(), 0, &carbonMeetingHotKeyRef)
+            klog("Carbon hotkey ⌥⌘M: status=\(meetingStatus)")
+            if meetingStatus != noErr { failedHotkeys.append("⌥⌘M (議事録)") }
+        } else {
+            klog("Carbon hotkey ⌥⌘M: disabled (opt-in, off by default)")
+        }
 
-        // ⌃⌥R 直前の認識をやり直す
+        // ⌃⌥R 直前の認識をやり直す（任意設定・デフォルトOFF — メニューの「↺ 直前の認識をやり直す」が主導線）
         if let ref = carbonRerecognizeHotKeyRef {
             UnregisterEventHotKey(ref)
             carbonRerecognizeHotKeyRef = nil
         }
-        var rerecID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 7)
-        let rerecStatus = RegisterEventHotKey(UInt32(kVK_ANSI_R),
-                                               UInt32(controlKey | optionKey),
-                                               rerecID, GetApplicationEventTarget(), 0, &carbonRerecognizeHotKeyRef)
-        klog("Carbon hotkey ⌃⌥R: status=\(rerecStatus)")
-        if rerecStatus != noErr { failedHotkeys.append("⌃⌥R (再認識)") }
+        if settings.rerecognizeHotkeyEnabled {
+            var rerecID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 7)
+            let rerecStatus = RegisterEventHotKey(UInt32(kVK_ANSI_R),
+                                                   UInt32(controlKey | optionKey),
+                                                   rerecID, GetApplicationEventTarget(), 0, &carbonRerecognizeHotKeyRef)
+            klog("Carbon hotkey ⌃⌥R: status=\(rerecStatus)")
+            if rerecStatus != noErr { failedHotkeys.append("⌃⌥R (再認識)") }
+        } else {
+            klog("Carbon hotkey ⌃⌥R: disabled (opt-in, off by default)")
+        }
+
+        // ⌥⌘R 🎙 ボイスレコーダー（デフォルトON — VoiceMemos置き換えの主機能なので他と違いopt-out方式）
+        if let ref = carbonVoiceRecorderHotKeyRef {
+            UnregisterEventHotKey(ref)
+            carbonVoiceRecorderHotKeyRef = nil
+        }
+        if settings.voiceRecorderHotkeyEnabled {
+            var recorderID = EventHotKeyID(signature: OSType(0x4B6F6500), id: 8)
+            let recorderStatus = RegisterEventHotKey(UInt32(kVK_ANSI_R),
+                                                      UInt32(cmdKey | optionKey),
+                                                      recorderID, GetApplicationEventTarget(), 0, &carbonVoiceRecorderHotKeyRef)
+            klog("Carbon hotkey ⌥⌘R (ボイスレコーダー): status=\(recorderStatus)")
+            if recorderStatus != noErr { failedHotkeys.append("⌥⌘R (ボイスレコーダー)") }
+        } else {
+            klog("Carbon hotkey ⌥⌘R: disabled by user setting")
+        }
 
         // 起動後初回の register で失敗があれば NSAlert で通知（reregisterHotkey 経由の再登録時は alert 出さず log のみ）
         if !failedHotkeys.isEmpty && !didShowFirstHotkeyAlert {
@@ -1028,7 +1125,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Translation hotkey (toggle mode: press to start, press again to stop)
-            if event.keyCode == transCode, !event.isARepeat {
+            // 任意設定・デフォルトOFF（本人指示 2026-07-16: メニューの「🌐 翻訳して録音」が主導線）
+            if settings.translateHotkeyEnabled, event.keyCode == transCode, !event.isARepeat {
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if flags == transMods {
                     DispatchQueue.main.async {
@@ -1174,8 +1272,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Recording
 
     private func startRecording() {
+        // 🎙 ボイスレコーダーが録音中はディクテーション録音を開始しない(マイク取り合い防止)
+        guard !VoiceMemoRecorder.shared.isRecording else {
+            klog("startRecording: blocked, VoiceMemoRecorder is active")
+            return
+        }
         // Stop wake word detector before AVAudioRecorder starts to avoid conflicts
         WakeWordDetector.shared.stop()
+
+        // このセッションが「ヘイ、Koe」起動かを確定させ、pendingフラグは即消費(以後の中断パスでの残留を防ぐ)
+        recognitionWakeTriggered = wakeTriggeredThisSession
+        wakeTriggeredThisSession = false
 
         // 録音中はシステム音量を下げる（マイクへの音漏れ防止）
         duckSystemVolume()
@@ -1185,7 +1292,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         klog("startRecording from app: \(activeAppBundleID)")
         isRecording    = true
         lastStreamingResult = nil
-        lastStreamingSampleCount = 0
+        streamingAccumulated = ""
+        streamingSegmentText = ""
+        streamingRapidRestartCount = 0
         recordingStart = Date()
         speechDetected = false  // 最初は未検知（動的閾値で判定）
         silenceStart   = nil
@@ -1197,6 +1306,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // mainKeyHeld はここでリセットしない（ホールド中に startRecording が呼ばれた場合、無音停止を防ぐため）
         speculativeResult = nil
         speculationID    += 1  // 前回の投機を無効化
+        speculationInFlight = false
         setIcon(recording: true)
         if !isMeetingAutoRecording {
             if overlay == nil { overlay = OverlayWindow() }
@@ -1204,6 +1314,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             overlay?.show(state: .recording)
         }
         recorder.start()
+        // 途中認識結果の逐次永続化を開始（強制終了しても次回起動時に復旧できる）
+        PartialTranscriptStore.shared.begin(audioPath: recorder.tempURL?.path)
         registerRecordingHotKeys()  // Space/ESC を Carbon Hot Key で登録
         isStreamingInFlight = false
         levelTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -1240,8 +1352,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setIcon(recording: false)
         restoreSystemVolume()
 
+        // この認識セッションの途中結果ファイルを認識完了まで保持（並行録音で新セッションが
+        // begin しても、このスナップショットで正しいファイルだけを後で削除できる）
+        recognitionPartialID = PartialTranscriptStore.shared.currentSessionID
+
         guard let audioURL = recorder.stop() else {
             klog("stopAndRecognize: recorder.stop() returned nil")
+            PartialTranscriptStore.shared.finish(id: recognitionPartialID)
             overlay?.hide()
             if AppSettings.shared.wakeWordEnabled {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { WakeWordDetector.shared.start() }
@@ -1253,6 +1370,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // speechDetected は参考情報のみ — peakLevel が十分あれば必ず認識する
         if peakLevel < 0.04 {
             klog("stopAndRecognize: peak level too low (\(String(format:"%.3f", peakLevel))), skipping")
+            PartialTranscriptStore.shared.finish(id: recognitionPartialID)
             overlay?.showHint("マイクの音量が小さすぎます")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.overlay?.hide() }
             if AppSettings.shared.wakeWordEnabled {
@@ -1266,6 +1384,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let wavSamples = WhisperContext.loadWAVPublic(url: audioURL),
            !AudioDSP.hasVoice(wavSamples, threshold: 0.005, minVoiceFrames: 4) {
             klog("stopAndRecognize: no voice detected, skipping recognition")
+            PartialTranscriptStore.shared.finish(id: recognitionPartialID)
             overlay?.showHint("音声が検出されませんでした")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.overlay?.hide() }
             // 議事録モード中は無音でも自動録音ループを継続
@@ -1288,12 +1407,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         isRecognizing = true
 
-        // Safety timeout: hide overlay if recognition takes >30 seconds (whisper hang guard)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+        // Safety timeout: 認識ハング時のオーバーレイ強制クローズ。
+        // 録音時間無制限化に伴い、録音が長いほど認識にも時間がかかるため録音長に比例させる
+        // （最低60秒、録音時間の1.5倍）。タイムアウトしても認識自体は中断しない —
+        // 結果が後から届けば履歴には保存される。
+        let recordedSec = recordingStart.map { Date().timeIntervalSince($0) } ?? 0
+        let watchdogSec = max(60.0, recordedSec * 1.5)
+        DispatchQueue.main.asyncAfter(deadline: .now() + watchdogSec) { [weak self] in
             guard let self, self.isRecognizing else { return }
-            klog("recognition timeout (30s) — force-hiding overlay")
+            klog("recognition timeout (\(Int(watchdogSec))s) — force-hiding overlay")
             self.isRecognizing = false
-            self.overlay?.showHint("認識がタイムアウトしました")
+            self.overlay?.showHint("認識に時間がかかっています（完了すると履歴に保存されます）")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.overlay?.hide() }
         }
 
@@ -1480,6 +1604,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 句読点スタイル変換
         if let style = VoiceCommands.PunctuationStyle(rawValue: AppSettings.shared.punctuationStyle) {
             formatted = VoiceCommands.applyPunctuationStyle(formatted, style: style)
+        }
+
+        // 🎙「ヘイ、Koe」ウェイクワード起動 → koe.live/agentと同じKoeエージェント(Claude+MCP)へ。
+        // タイプ入力/ローカルAgentMode/議事録コマンド等はスキップ(ウェイクワードは常にエージェント宛の発話)
+        if recognitionWakeTriggered {
+            recognitionWakeTriggered = false
+            klog("KoeAgent(wake): '\(formatted.prefix(80))'")
+            HistoryStore.shared.add("[ヘイKoe] \(formatted)", audioFileID: lastArchiveID)
+            overlay?.hide()
+            KoeAgentBridge.shared.send(formatted, voiceID: "") { [weak self] message in
+                self?.sendNotification(text: message)
+            }
+            postRecognitionCleanup()
+            return
         }
 
         // 議事録音声コマンド: 「ここ重要」等
@@ -1722,6 +1860,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 認識完了後の共通処理: メニュー更新 + ウェイクワード再開 + 議事録自動録音
     private func postRecognitionCleanup() {
+        // 認識結果は履歴へ保存済み → このセッションの途中結果ファイルを削除
+        // （並行録音中の新セッションは別IDの別ファイルなので影響しない）
+        PartialTranscriptStore.shared.finish(id: recognitionPartialID)
+        recognitionPartialID = nil
         rebuildMenu()
         if seamlessModeActive {
             // 並行録音がすでに起動済みの場合はスキップ（重複防止）
@@ -1766,8 +1908,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// ⌃⌥R: 直前の認識を現在のモデルで再認識してテキストを置換
-    func rerecognizeLast() {
+    /// ⌃⌥R (任意設定) / メニュー「↺ 直前の認識をやり直す」: 直前の認識を現在のモデルで再認識してテキストを置換
+    @objc func rerecognizeLast() {
         guard !isRecording, !isRecognizing else { return }
         guard let entry = HistoryStore.shared.entries.first,
               let fid = entry.audioFileID,
@@ -1792,6 +1934,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.typer.deleteAndReplace(oldText: entry.text, newText: text, bundleID: self?.activeAppBundleID ?? "")
             }
             HistoryStore.shared.updateText(id: entry.id, newText: text, modelName: model.name, recognitionTime: time)
+        }
+    }
+
+    /// クラッシュ復旧した録音をバックグラウンドで再認識し、履歴を実際の文字起こしに更新する。
+    /// whisperモデルのロード前や録音中は待ってリトライ。失敗しても途中テキストと音声は保全済み。
+    private func scheduleRecoveredRetranscription(_ items: [CrashRecovery.RecoveredItem], attempt: Int) {
+        let delay: TimeInterval = attempt == 0 ? 10 : 30
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard WhisperContext.shared.isLoaded, !self.isRecording, !self.isRecognizing else {
+                if attempt < 5 {
+                    self.scheduleRecoveredRetranscription(items, attempt: attempt + 1)
+                } else {
+                    klog("CrashRecovery: re-transcription skipped (whisper unavailable/busy) — partial text & audio preserved")
+                }
+                return
+            }
+            self.retranscribeRecovered(items, index: 0)
+        }
+    }
+
+    private func retranscribeRecovered(_ items: [CrashRecovery.RecoveredItem], index: Int) {
+        guard index < items.count else { return }
+        let item = items[index]
+        guard let url = item.audioURL else {
+            retranscribeRecovered(items, index: index + 1)
+            return
+        }
+        let rawLang = AppSettings.shared.language
+        let lang = rawLang == "auto" ? "auto" : (rawLang.components(separatedBy: "-").first ?? "en")
+        WhisperContext.shared.transcribe(url: url, language: lang) { [weak self] text in
+            if let text, !text.isEmpty, !Self.isHallucination(text) {
+                // updateText は元テキストを originalText に保持するので、途中結果も失われない
+                HistoryStore.shared.updateText(id: item.historyID, newText: "[復旧] \(text)",
+                                               modelName: ModelDownloader.shared.currentModel.name,
+                                               recognitionTime: WhisperContext.shared.lastTranscriptionTime)
+                klog("CrashRecovery: re-transcribed → '\(text.prefix(40))'")
+            }
+            DispatchQueue.main.async { self?.retranscribeRecovered(items, index: index + 1) }
         }
     }
 
@@ -1834,9 +2015,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startSpeculation() {
+        guard !speculationInFlight else { return }  // 60fps呼び出しでの多重発火防止
         guard AppSettings.shared.recognitionEngine == .whisperCpp,
               let srcURL = recorder.tempURL else { return }
 
+        // 長尺録音は投機しない: 録音中ファイルのコピーがメインスレッドを塞ぐ
+        // (30MB ≈ 15分。これ以上は停止後の通常認識に任せる)
+        let srcSize = (try? FileManager.default.attributesOfItem(atPath: srcURL.path)[.size] as? Int) ?? 0
+        if srcSize > 30_000_000 {
+            return
+        }
+
+        speculationInFlight = true
         let myID = speculationID
         let profile = AppSettings.shared.profile(for: activeAppBundleID)
         let rawLang = (profile?.language.isEmpty == false ? profile!.language : AppSettings.shared.language)
@@ -1857,9 +2047,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard (try? FileManager.default.copyItem(at: srcURL, to: specURL)) != nil else { return }
 
             WhisperContext.shared.transcribe(url: specURL, language: lang, prompt: contextPrompt) { [weak self] text in
-                guard let self, self.speculationID == myID, let text, !text.isEmpty else { return }
-                klog("Speculation: result ready '\(text)'")
-                self.speculativeResult = text
+                guard let self else { return }
+                DispatchQueue.main.async {
+                    guard self.speculationID == myID else { return }  // 古い投機の完了は無視
+                    self.speculationInFlight = false
+                    guard let text, !text.isEmpty else { return }
+                    klog("Speculation: result ready '\(text)'")
+                    self.speculativeResult = text
+                }
             }
             return
         }
@@ -1872,9 +2067,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard (try? FileManager.default.copyItem(at: srcURL, to: specURL)) != nil else { return }
 
         WhisperServer.shared.transcribe(url: specURL, language: lang, prompt: contextPrompt) { [weak self] text in
-            guard let self, self.speculationID == myID, let text, !text.isEmpty else { return }
-            klog("Speculation: result ready '\(text)'")
-            DispatchQueue.main.async { self.speculativeResult = text }
+            guard let self else { return }
+            DispatchQueue.main.async {
+                guard self.speculationID == myID else { return }
+                self.speculationInFlight = false
+                guard let text, !text.isEmpty else { return }
+                klog("Speculation: result ready '\(text)'")
+                self.speculativeResult = text
+            }
         }
     }
 
@@ -1891,7 +2091,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // → 話し終わった瞬間にApple Speech結果を先行入力
         // → Whisperの高精度結果で後から静かに置換
 
-        // Apple Speech APIでリアルタイムプレビュー（whisperとは独立）
+        // Apple Speech APIでリアルタイムプレビュー（whisperとは独立）。
+        // タスクは〜1分程度で終了するため、セグメント方式で自動再開し録音時間無制限に追従する。
+        beginStreamingSegment()
+
+        // 録音バッファをApple Speechに定期的に送る（40ms間隔で高速フィードバック）
+        // recorder.newStreamingSamples() は未読分のみ返すため、長時間録音でもコスト一定。
+        streamingTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
+            guard let self, self.isRecording,
+                  let request = self.streamingRecognitionRequest,
+                  let newSamples = self.recorder.newStreamingSamples(), !newSamples.isEmpty else { return }
+
+            // Float32 → PCMBuffer
+            let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(newSamples.count)) else { return }
+            buffer.frameLength = AVAudioFrameCount(newSamples.count)
+            let dst = buffer.floatChannelData![0]
+            for i in 0..<newSamples.count { dst[i] = newSamples[i] }
+            request.append(buffer)
+        }
+    }
+
+    /// 確定済みセグメント + 現在のセグメント途中テキストの結合
+    private func combinedStreamingText() -> String {
+        if streamingAccumulated.isEmpty { return streamingSegmentText }
+        if streamingSegmentText.isEmpty { return streamingAccumulated }
+        return streamingAccumulated + " " + streamingSegmentText
+    }
+
+    /// Apple Speech の認識セグメントを1つ開始する
+    private func beginStreamingSegment() {
         let lang = AppSettings.shared.language
         let locale = lang == "auto" ? Locale.current : Locale(identifier: lang)
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else { return }
@@ -1902,46 +2131,77 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if #available(macOS 13, *) {
             request.addsPunctuation = true
         }
-        streamingRecognitionRequest = request
-
-        // 録音バッファをApple Speechに定期的に送る（40ms間隔で高速フィードバック）
-        streamingTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
-            guard let self, self.isRecording,
-                  let samples = self.recorder.currentSamples(), !samples.isEmpty else { return }
-            // 前回からの差分だけ送る
-            let newCount = samples.count - self.lastStreamingSampleCount
-            guard newCount > 0 else { return }
-            let newSamples = Array(samples.suffix(newCount))
-            self.lastStreamingSampleCount = samples.count
-
-            // Float32 → PCMBuffer
-            let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(newSamples.count)) else { return }
-            buffer.frameLength = AVAudioFrameCount(newSamples.count)
-            let dst = buffer.floatChannelData![0]
-            for i in 0..<newSamples.count { dst[i] = newSamples[i] }
-            request.append(buffer)
+        // データを勝手に外へ流さない: プレビューは常に on-device 認識のみ。
+        // 非対応 (言語/OS) ならプレビューを諦める — 最終認識はローカル whisper が担う。
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        } else {
+            klog("Streaming preview disabled: on-device recognition unsupported (audio never leaves this Mac)")
+            streamingRecognizer = nil
+            return
         }
+        streamingRecognitionRequest = request
 
         streamingRecognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
             if let error {
                 klog("Streaming preview error: \(error.localizedDescription)")
-                // 認識エラー時はタスクをクリーンアップ（次回録音で再生成）
-                self.streamingRecognitionTask = nil
-                self.streamingRecognitionRequest = nil
+                self.rollStreamingSegment(failed: true)
                 return
             }
             guard let result else { return }
             let text = result.bestTranscription.formattedString
             if !text.isEmpty {
-                self.lastStreamingResult = text
+                self.streamingSegmentText = text
+                let combined = self.combinedStreamingText()
+                self.lastStreamingResult = combined
+                // 途中結果を逐次永続化（強制終了してもここまでは残る）
+                PartialTranscriptStore.shared.update(text: combined)
                 // オーバーレイにストリーミングテキストを表示（録音中 & 認識中の両方）
-                self.overlay?.updateStreamingText(text)
+                self.overlay?.updateStreamingText(combined)
                 if MeetingMode.shared.isActive {
-                    self.meetingLiveWindow?.updateStreamingText(text)
-                    self.meetingOverlay?.updateLastText(text)
+                    self.meetingLiveWindow?.updateStreamingText(combined)
+                    self.meetingOverlay?.updateLastText(combined)
                 }
+            }
+            if result.isFinal {
+                // Apple Speech がセグメントを確定（〜1分制限）→ 録音継続中なら次セグメントへ
+                self.rollStreamingSegment(failed: false)
+            }
+        }
+    }
+
+    /// 現セグメントを確定分に積んで、録音継続中なら新しいセグメントを開始する
+    private func rollStreamingSegment(failed: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if !self.streamingSegmentText.isEmpty {
+                self.streamingAccumulated = self.combinedStreamingText()
+                self.streamingSegmentText = ""
+            }
+            self.streamingRecognitionRequest?.endAudio()
+            self.streamingRecognitionTask?.cancel()
+            self.streamingRecognitionRequest = nil
+            self.streamingRecognitionTask = nil
+            guard self.isRecording else { return }
+
+            // エラーの高速連発（音声認識サービス不調）はあきらめる — whisperの最終認識は生きている
+            if failed {
+                if Date().timeIntervalSince(self.lastStreamingRestart) < 2.0 {
+                    self.streamingRapidRestartCount += 1
+                } else {
+                    self.streamingRapidRestartCount = 0
+                }
+                if self.streamingRapidRestartCount >= 3 {
+                    klog("Streaming preview: giving up after repeated errors (whisper final recognition unaffected)")
+                    return
+                }
+            }
+            self.lastStreamingRestart = Date()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self, self.isRecording, self.streamingRecognitionTask == nil else { return }
+                klog("Streaming preview: starting next segment (accumulated \(self.streamingAccumulated.count) chars)")
+                self.beginStreamingSegment()
             }
         }
     }
@@ -1956,12 +2216,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // デバッグ: 約1秒に1回レベルをログ出力
         if levelHistory.count == levelHistorySize && Int(Date().timeIntervalSince(recordingStart ?? Date()) * 3) % 3 == 0 {
             klog("VAD level=\(String(format:"%.3f", smoothed)) thr=\(String(format:"%.3f", voiceThreshold)) ambient=\(String(format:"%.3f", ambientNoiseLevel)) voice=\(speechDetected)")
-        }
-
-        // 最大録音時間チェック
-        if let start = recordingStart, Date().timeIntervalSince(start) > maxRecordDuration {
-            klog("Auto-stop: max duration reached")
-            stopAndRecognize(); return
         }
 
         // 30秒経過したらスペースヒントを表示
@@ -1990,6 +2244,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 silenceStart = nil
                 speculationID += 1
                 speculativeResult = nil
+                speculationInFlight = false
                 klog("Speculation: invalidated (speech resumed)")
             }
         } else if speechDetected && smoothed < dynamicSilenceThreshold {
@@ -2039,6 +2294,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         speculationID += 1  // 進行中の認識を無効化
         setIcon(recording: false)
         restoreSystemVolume()
+        // ESC = ユーザーの意図的な破棄 → 途中結果も削除
+        PartialTranscriptStore.shared.finishCurrent()
+        PartialTranscriptStore.shared.finish(id: recognitionPartialID)
+        recognitionPartialID = nil
         recorder.cancel()
         speech.cancel()
         overlay?.hide()
@@ -2098,6 +2357,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         task.arguments = ["-e", script]
         try? task.run()
         klog("Volume restored: → \(vol)")
+    }
+
+    // MARK: - Analytics (atsm-pulse)
+
+    /// 起動回数など最小限のイベントのみ送信する。プロジェクト名とイベント名だけを送り、
+    /// 音声・認識結果・個人データは一切送らない（Koe のローカル完結原則を維持）。
+    private func trackEvent(_ event: String) {
+        // オフラインモード中は ping すら外に出さない（「全 cloud 通信 block」の約束を守る）
+        guard !AppSettings.shared.offlineModeEnabled else { return }
+        guard let url = URL(string: "https://atsm-pulse.fly.dev/e") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["project": "koe", "event": event])
+        req.timeoutInterval = 3
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     // MARK: - Notification
@@ -2232,6 +2507,82 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    /// メニュー「🗣 自分の声で読み上げ…」— 何を読むか選べる小窓を開く(SpeakMyVoiceWindow)。
+    @objc private func openSpeakMyVoiceWindow() {
+        SpeakMyVoiceWindow.shared.show()
+    }
+
+    /// 🗣 自分の声で読み上げ (自動化用・無確認): 選択テキスト → クリップボード → 直近の認識結果 の順で対象を決め、
+    /// koe-mcp (https://mcp.koe.live/mcp) の `speak` ツールへ HTTP(JSON-RPC) で本人声クローン合成を依頼して再生する。
+    /// (旧 SSH 経由 `ssh m5 → koe_say.py` は廃止済み。実装は MyVoiceTTS.shared.speak)
+    /// Shortcuts.app からの `koe://speak` (text 省略時) のみが呼ぶ。手動操作は openSpeakMyVoiceWindow() 経由。
+    @objc func speakWithMyVoice() {
+        var text = ""
+        // 1. アクセシビリティで選択テキスト
+        if AXIsProcessTrusted() {
+            let systemWide = AXUIElementCreateSystemWide()
+            var focused: AnyObject?
+            AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focused)
+            if let el = focused {
+                var sel: AnyObject?
+                AXUIElementCopyAttributeValue(el as! AXUIElement, kAXSelectedTextAttribute as CFString, &sel)
+                text = (sel as? String) ?? ""
+            }
+        }
+        // 2. クリップボード
+        if text.isEmpty {
+            text = NSPasteboard.general.string(forType: .string) ?? ""
+        }
+        // 3. 直近の認識結果
+        if text.isEmpty {
+            text = HistoryStore.shared.entries.first?.text ?? ""
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            sendNotification(text: "読み上げるテキストがありません（選択 / コピーしてから実行）")
+            return
+        }
+        // 長文ガード: Qwen3-TTS は長文で品質が落ちるため 800 文字で切る
+        let target = String(trimmed.prefix(800))
+        if overlay == nil { overlay = OverlayWindow() }
+        overlay?.show(state: .recognizing)
+        overlay?.showHint("🗣 自分の声で生成中…")
+        MyVoiceTTS.shared.speak(target) { [weak self] ok, message in
+            self?.overlay?.hide()
+            if !ok {
+                // 本人声が使えない(オフライン/未疎通/鍵なし)時も、必ず声は出す。
+                // macOS 内蔵音声へフォールバック＝設定ゼロで誰でも使える。
+                self?.speakWithSystemVoice(target)
+                self?.sendNotification(text: "オフライン音声で読み上げました（本人声: \(message)）")
+            }
+        }
+    }
+
+    /// macOS 内蔵の音声合成で読み上げる（オフライン・鍵不要のフォールバック）。
+    /// 日本語が含まれれば ja-JP、なければ端末既定/英語を選ぶ。
+    private func speakWithSystemVoice(_ text: String) {
+        systemSpeech.stopSpeaking(at: .immediate)
+        let u = AVSpeechUtterance(string: text)
+        let hasJa = text.unicodeScalars.contains { $0.value >= 0x3040 && $0.value <= 0x30FF
+            || ($0.value >= 0x4E00 && $0.value <= 0x9FFF) }
+        let lang = hasJa ? "ja-JP" : "en-US"
+        u.voice = AVSpeechSynthesisVoice(language: lang)
+        u.rate = AVSpeechUtteranceDefaultSpeechRate
+        systemSpeech.speak(u)
+    }
+
+    @objc func toggleAlwaysOnRecording() {
+        let s = AppSettings.shared
+        s.alwaysOnRecordingEnabled.toggle()
+        if s.alwaysOnRecordingEnabled {
+            AlwaysOnRecorder.shared.start()
+        } else {
+            AlwaysOnRecorder.shared.stop()
+        }
+        klog("AlwaysOnRecording: \(s.alwaysOnRecordingEnabled)")
+        rebuildMenu()
+    }
+
     @objc func toggleMeetingMode() {
         let wasActive = MeetingMode.shared.isActive
         MeetingMode.shared.toggle()
@@ -2351,6 +2702,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    /// 🌐 翻訳して録音 — メニューからのクリックで翻訳モード付き録音を開始する。
+    /// 2026-07 簡略化（本人指示）: 翻訳ホットキー(⌥⌘T)はデフォルトOFFにしたため、
+    /// Carbon ホットキー(id==2)ハンドラと同じ開始ロジックをここに用意。
+    @objc private func startTranslateRecordingFromMenu() {
+        guard !isRecording else { return }
+        isTranslateMode = true
+        overlay?.setTranslateMode(true)
+        klog("Translate mode: ON (menu)")
+        startRecording()
+    }
+
+    /// 💬 メッセージ (Web) — koe.live/app（統合Webアプリ）をウィンドウで開く。
+    @objc private func openKoeWebApp() {
+        KoeWebWindow.shared.show()
+    }
+
+    /// 📻 KOE ラジオ — koe.live/live（24時間・本人声のAIラジオ）をウィンドウで開く(v3新機能)。
+    @objc private func openKoeLive() {
+        KoeLiveWindow.shared.show()
+    }
+
+    /// 🔊 声を送る — テキスト→クローン声→相手へメール（VoiceMessageWindow）。
+    @objc private func openVoiceMessage() {
+        VoiceMessageWindow.shared.show()
+    }
+
+    /// 🎙 ボイスレコーダー — Apple標準ボイスメモの置き換え(v3新機能)。
+    @objc private func openVoiceRecorder() {
+        VoiceRecorderWindow.shared.show()
+    }
+
     @objc private func openFileTranscription() {
         let panel = NSOpenPanel()
         panel.title = L10n.fileTranscriptionTitle
@@ -2453,6 +2835,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.overlay?.setTranslateMode(true)
                 klog("URL scheme: translate mode ON")
                 self.startRecording()
+            }
+        case "speak":
+            // koe://speak?text=... — 自分の声で読み上げ (text 省略時は選択/クリップボード/直近認識)
+            let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "text" })?.value ?? ""
+            DispatchQueue.main.async {
+                if q.isEmpty {
+                    self.speakWithMyVoice()
+                } else {
+                    MyVoiceTTS.shared.speak(String(q.prefix(800))) { [weak self] ok, message in
+                        if !ok { self?.sendNotification(text: message) }
+                    }
+                }
+            }
+        case "play":
+            // koe://play?url=... — koe.live/play(共通プレイヤー)の「Koe.appで開く」着地点。
+            // 任意URLは開かない: https + koe系ホストのmp3だけ再生する。
+            let raw = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "url" })?.value ?? ""
+            let allowedHosts = ["koe.live", "www.koe.live", "mcp.koe.live"]
+            guard let audio = URL(string: raw), audio.scheme == "https",
+                  allowedHosts.contains(audio.host ?? "") else {
+                klog("URL scheme: play rejected '\(raw)'")
+                return
+            }
+            DispatchQueue.main.async {
+                MyVoiceTTS.shared.playRemote(audio) { [weak self] ok, message in
+                    if !ok { self?.sendNotification(text: message) }
+                }
+            }
+        case "connect":
+            // koe://connect?key=koe_... — mcp.koe.live/login?redirect=mac からの折り返し。
+            // ブラウザでのログイン完了→ここでKeychainに保存、コピペ不要のワンクリック接続。
+            let key = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "key" })?.value ?? ""
+            DispatchQueue.main.async {
+                if KoeAccount.save(key) {
+                    klog("URL scheme: Koe account connected")
+                    self.sendNotification(text: "✅ Koeアカウントを接続しました")
+                } else {
+                    self.sendNotification(text: "⚠️ 接続に失敗しました（鍵が空でした）")
+                }
             }
         default:
             klog("URL scheme: unknown host '\(url.host ?? "")'")

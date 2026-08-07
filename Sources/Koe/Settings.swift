@@ -144,6 +144,7 @@ enum LLMMode: String, CaseIterable, Codable {
 }
 
 enum LLMProvider: String, CaseIterable {
+    case nouLocal  = "nou-local"   // NOU local node (in-process MLX-Swift, OpenAI 互換 :4001)
     case chatweb   = "chatweb"     // chatweb.ai (default, free)
     case openai    = "openai"      // OpenAI
     case anthropic = "anthropic"   // Anthropic Claude
@@ -152,6 +153,7 @@ enum LLMProvider: String, CaseIterable {
 
     var displayName: String {
         switch self {
+        case .nouLocal:  return "NOU (ローカル・本機/LAN)"
         case .chatweb:   return "chatweb.ai (無料)"
         case .openai:    return "OpenAI"
         case .anthropic: return "Anthropic Claude"
@@ -162,6 +164,8 @@ enum LLMProvider: String, CaseIterable {
 
     var baseURL: String {
         switch self {
+        // NOU ローカルプロキシ (OpenAI 互換)。loopback なので NOU 側は無認証で通る。
+        case .nouLocal:  return "http://127.0.0.1:4001"
         case .chatweb:   return "https://api.chatweb.ai"
         case .openai:    return "https://api.openai.com"
         case .anthropic: return "https://api.anthropic.com"
@@ -170,8 +174,20 @@ enum LLMProvider: String, CaseIterable {
         }
     }
 
+    /// nou-local 用に nouPort を反映した baseURL。
+    /// 永続化ミラー(llmBaseURL)に依存せず常に loopback を組み立てるので、
+    /// llmBaseURL にクラウドhostが残っていてもクラウドへ漏れない。
+    func baseURL(nouPort: Int) -> String {
+        switch self {
+        case .nouLocal:  return "http://127.0.0.1:\(nouPort > 0 ? nouPort : 4001)"
+        default:         return baseURL
+        }
+    }
+
     var defaultModel: String {
         switch self {
+        // モデルIDはエイリアス禁止だが "auto" は NOU SmartRouter が slot を自動選択する正規の指定。
+        case .nouLocal:  return "auto"
         case .chatweb:   return "nemotron"
         case .openai:    return "gpt-4o-mini"
         case .anthropic: return "claude-haiku-4-5-20251001"
@@ -182,9 +198,15 @@ enum LLMProvider: String, CaseIterable {
 
     var requiresAPIKey: Bool {
         switch self {
-        case .chatweb: return false
-        default:       return true
+        case .chatweb, .nouLocal: return false
+        default:                  return true
         }
+    }
+
+    /// 推論が端末内/LAN 内で完結し、クラウドに送られないプロバイダかどうか。
+    /// Offline Mode 中でもこれらは許可する（NOU ローカル = 自分のノードのみに送る）。
+    var isLocalInference: Bool {
+        self == .nouLocal
     }
 }
 
@@ -240,6 +262,15 @@ class AppSettings: ObservableObject {
     @Published var translateHotkeyCode: Int   { didSet { ud.set(translateHotkeyCode, forKey: "translateHotkeyCode") } }
     @Published var translateHotkeyModifiers: UInt { didSet { ud.set(Int(bitPattern: translateHotkeyModifiers), forKey: "translateHotkeyModifiers") } }
     @Published var translateTargetLang: String { didSet { ud.set(translateTargetLang, forKey: "translateTargetLang") } }
+
+    // 2026-07: ホットキー簡略化（本人指示）— 録音トグル1つを主役にし、翻訳/議事録/再認識の
+    // 各ホットキーは任意設定・デフォルトOFFに。OFFの間もメニューバーからクリックで使える。
+    // Reregister が必要なので AppDelegate.reregisterHotkey() を呼ぶのは Settings UI 側の責務。
+    @Published var translateHotkeyEnabled: Bool   { didSet { ud.set(translateHotkeyEnabled, forKey: "translateHotkeyEnabled") } }
+    @Published var meetingHotkeyEnabled: Bool     { didSet { ud.set(meetingHotkeyEnabled, forKey: "meetingHotkeyEnabled") } }
+    @Published var rerecognizeHotkeyEnabled: Bool { didSet { ud.set(rerecognizeHotkeyEnabled, forKey: "rerecognizeHotkeyEnabled") } }
+    /// 🎙 ボイスレコーダーはVoiceMemos置き換えの主機能のため、他の副次ホットキーと違いデフォルトON。
+    @Published var voiceRecorderHotkeyEnabled: Bool { didSet { ud.set(voiceRecorderHotkeyEnabled, forKey: "voiceRecorderHotkeyEnabled") } }
 
     // Recognition
     @Published var language: String          { didSet { ud.set(language,               forKey: "language"); AppDelegate.shared?.reloadSpeechEngine() } }
@@ -455,6 +486,10 @@ class AppSettings: ObservableObject {
     @Published var audioArchiveMaxDays: Int { didSet { ud.set(audioArchiveMaxDays, forKey: "audioArchiveMaxDays") } }
     @Published var audioArchiveAutoPrune: Bool { didSet { ud.set(audioArchiveAutoPrune, forKey: "audioArchiveAutoPrune") } }
 
+    // 常時録音: ホットキー録音以外の時間もマイク音声をバックグラウンドで録り続ける
+    // (10分チャンクでアーカイブへ・完全ローカル・本人指示 2026-06-12)。プライバシー配慮でデフォルト OFF
+    @Published var alwaysOnRecordingEnabled: Bool { didSet { ud.set(alwaysOnRecordingEnabled, forKey: "alwaysOnRecordingEnabled") } }
+
     // Fn キー対応: 単独タップ / 押している間だけ録音
     @Published var fnKeyEnabled: Bool { didSet { ud.set(fnKeyEnabled, forKey: "fnKeyEnabled") } }
     @Published var fnKeyMode: String  { didSet { ud.set(fnKeyMode, forKey: "fnKeyMode") } }
@@ -590,6 +625,11 @@ class AppSettings: ObservableObject {
         let savedLang = ud.string(forKey: "language") ?? "ja-JP"
         let defaultTarget = savedLang.hasPrefix("ja") ? "en" : "ja"
         translateTargetLang = ud.string(forKey: "translateTargetLang") ?? defaultTarget
+        // 副次ホットキー: デフォルトOFF（メニューバーからのクリックが主導線 / 本人指示 2026-07-16）
+        translateHotkeyEnabled   = ud.object(forKey: "translateHotkeyEnabled") as? Bool ?? false
+        meetingHotkeyEnabled     = ud.object(forKey: "meetingHotkeyEnabled") as? Bool ?? false
+        rerecognizeHotkeyEnabled = ud.object(forKey: "rerecognizeHotkeyEnabled") as? Bool ?? false
+        voiceRecorderHotkeyEnabled = ud.object(forKey: "voiceRecorderHotkeyEnabled") as? Bool ?? true
 
         language          = savedLang
         menuBarLanguageCodes = (ud.data(forKey: "menuBarLanguageCodes").flatMap { try? JSONDecoder().decode([String].self, from: $0) })
@@ -659,12 +699,15 @@ class AppSettings: ObservableObject {
         duckingMode = ud.string(forKey: "duckingMode") ?? "off"  // デフォルト off（共有スピーカー MTG での誤検知防止 / R1 privacy）
         offlineModeEnabled = ud.object(forKey: "offlineModeEnabled") as? Bool ?? true  // デフォルトON（プライバシーファースト / R1 privacy）
         audioInputDeviceUID = ud.string(forKey: "audioInputDeviceUID") ?? ""  // 空 = システムデフォルト
-        // 音声アーカイブ系（プライバシー配慮でデフォルト OFF）
+        // 音声アーカイブ系（プライバシー配慮で opt-in。同意モーダルあり — PR #13 P2/P3 対応）
+        // v2.11〜: opt-in 後の既定は「失わない」方向に変更 — 日数 prune 無効 (0=無期限)、
+        // サイズ上限 50GB のみディスク保護の安全弁として残す。
         audioArchiveEnabled  = ud.object(forKey: "audioArchiveEnabled") as? Bool ?? false
         audioArchivePath     = ud.string(forKey: "audioArchivePath") ?? ""
-        audioArchiveMaxGB    = ud.object(forKey: "audioArchiveMaxGB") as? Double ?? 10.0
-        audioArchiveMaxDays  = ud.object(forKey: "audioArchiveMaxDays") as? Int ?? 30
+        audioArchiveMaxGB    = ud.object(forKey: "audioArchiveMaxGB") as? Double ?? 50.0
+        audioArchiveMaxDays  = ud.object(forKey: "audioArchiveMaxDays") as? Int ?? 0
         audioArchiveAutoPrune = ud.object(forKey: "audioArchiveAutoPrune") as? Bool ?? true
+        alwaysOnRecordingEnabled = ud.object(forKey: "alwaysOnRecordingEnabled") as? Bool ?? false
         // Fn キー設定（デフォルトOFF / tap_toggle）
         fnKeyEnabled = ud.object(forKey: "fnKeyEnabled") as? Bool ?? false
         fnKeyMode    = ud.string(forKey: "fnKeyMode") ?? "tap_toggle"
@@ -691,8 +734,10 @@ class AppSettings: ObservableObject {
             let hasWhisperCpp = !whisperCppBinaryPath.isEmpty || !whisperCppModelPath.isEmpty
             recognitionEngine = hasWhisperCpp ? .whisperCpp : .appleOnDevice
         }
-        // LLM がクラウドプロバイダ経由ならローカル LLM 推論に固定
-        if llmEnabled && !llmUseLocal {
+        // LLM がクラウドプロバイダ経由ならローカル LLM 推論に固定。
+        // ただし nou-local は推論が自分のノード(127.0.0.1/LAN)で完結しクラウドに出ないため、
+        // Offline Mode 中でもそのまま remote 経路(NOU :4001)を使ってよい。
+        if llmEnabled && !llmUseLocal && !llmProvider.isLocalInference {
             llmUseLocal = true
         }
     }
