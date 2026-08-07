@@ -169,6 +169,36 @@ final class MyVoiceTTS: NSObject, AVAudioPlayerDelegate {
         isGenerating = false
     }
 
+    /// koe://play?url=... — koe系ホストのmp3をダウンロードしてそのまま再生する。
+    /// ホストの許可判定は呼び出し側(AppDelegate)が済ませている前提。
+    func playRemote(_ url: URL, completion: @escaping (Bool, String) -> Void) {
+        stop()
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 30
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
+            guard let self else { return }
+            self.currentTask = nil
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard error == nil, let data, status == 200 else {
+                klog("MyVoiceTTS: playRemote failed status=\(status) err=\(error?.localizedDescription ?? "-")")
+                DispatchQueue.main.async { completion(false, "声を取得できませんでした") }
+                return
+            }
+            // mp3 マジック(ID3 / 0xFF)のゆるい検証 — エラーページ等を再生しない
+            let looksLikeMP3 = data.count > 1_000 && (data.prefix(3) == Data("ID3".utf8) || data.first == 0xFF)
+            guard looksLikeMP3 else {
+                klog("MyVoiceTTS: playRemote not mp3 (bytes=\(data.count))")
+                DispatchQueue.main.async { completion(false, "音声データが不正です") }
+                return
+            }
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("koe_play_\(UUID().uuidString).mp3")
+            try? data.write(to: tmp, options: .atomic)
+            DispatchQueue.main.async { self.play(url: tmp, completion: completion) }
+        }
+        currentTask = task
+        task.resume()
+    }
+
     private func play(url: URL, completion: @escaping (Bool, String) -> Void) {
         do {
             let p = try AVAudioPlayer(contentsOf: url)

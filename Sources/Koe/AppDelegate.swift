@@ -2849,6 +2849,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
+        case "play":
+            // koe://play?url=... — koe.live/play(共通プレイヤー)の「Koe.appで開く」着地点。
+            // 任意URLは開かない: https + koe系ホストのmp3だけ再生する。
+            let raw = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "url" })?.value ?? ""
+            let allowedHosts = ["koe.live", "www.koe.live", "mcp.koe.live"]
+            guard let audio = URL(string: raw), audio.scheme == "https",
+                  allowedHosts.contains(audio.host ?? "") else {
+                klog("URL scheme: play rejected '\(raw)'")
+                return
+            }
+            DispatchQueue.main.async {
+                MyVoiceTTS.shared.playRemote(audio) { [weak self] ok, message in
+                    if !ok { self?.sendNotification(text: message) }
+                }
+            }
+        case "connect":
+            // koe://connect?key=koe_... — mcp.koe.live/login?redirect=mac からの折り返し。
+            // ブラウザでのログイン完了→ここでKeychainに保存、コピペ不要のワンクリック接続。
+            let key = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "key" })?.value ?? ""
+            DispatchQueue.main.async {
+                if KoeAccount.save(key) {
+                    klog("URL scheme: Koe account connected")
+                    self.sendNotification(text: "✅ Koeアカウントを接続しました")
+                } else {
+                    self.sendNotification(text: "⚠️ 接続に失敗しました（鍵が空でした）")
+                }
+            }
         default:
             klog("URL scheme: unknown host '\(url.host ?? "")'")
         }
